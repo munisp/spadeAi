@@ -79,7 +79,7 @@ any → failed (with compensations; never reported as running)
   0. **LLM routing:** the `llm_router` picks a backend from the org's `ai_policy`: `self_hosted` (vLLM serving open-weight models in-country), `external` (OpenAI-compatible providers via an allow-list), or `hybrid` (self-hosted first, external as fallback or for complex cases).
      - Residency-bound tenants (gov, regulated) are locked to `self_hosted`.
      - The policy, model used and token usage are recorded per session for audit and billing.
-     - If the selected backend is down, the router fails closed: it reports `unavailable` and never silently switches to a backend the policy does not allow.
+     - If a backend is down, the router tries another backend only when `ai_policy` permits it (including the external fallback under `hybrid`); otherwise it reports `unavailable`. `self_hosted` never falls back to external.
   1. LLM triage, answer-only.
   2. If shell is needed, the user approves explicitly.
   3. A pre-change snapshot is taken.
