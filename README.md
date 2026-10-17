@@ -61,12 +61,21 @@ Backups are isolated per service. The tenant restic REST server (compose `backup
 
 ### Two-site HA rehearsal (Lagos / Abuja)
 
-`deploy/ha/docker-compose.ha.yml` runs, on one machine, the layout meant for separate sites:
-- **Postgres:** `pg-lagos` is the primary and `pg-abuja` a synchronous hot standby (`synchronous_standby_names = 'ANY 1 (abuja)'`), so a commit is acknowledged only once Abuja has it. Point services at both with `SPADE_DATABASE_URL=postgres://...@lagos:5432,abuja:5432/spadeai?target_session_attrs=read-write`; pgx connects to whichever is primary.
-- **TigerBeetle:** 3 replicas, one each in Lagos, Abuja and a witness site (`TB_ADDRESSES=lagos:3000,abuja:3000,witness:3000`). Two sites alone can't survive losing the one holding the majority.
+`deploy/ha/docker-compose.ha.yml` runs, on one machine, the layout meant for three separate sites: Lagos, Abuja and a witness site (location still to be chosen) that only holds tie-breaker votes.
+- **Consensus:** etcd, one member per site. Any two sites form a quorum.
+- **Postgres:** Patroni on `pg-lagos` and `pg-abuja` with `synchronous_mode`, so a commit is acknowledged only once the synchronous standby has it, and Patroni promotes only that standby. Failover is automatic; a primary cut off from etcd demotes itself, and a returning old primary is rewound (`pg_rewind`) and rejoins as a standby.
+- **Floating address:** `haproxy-lagos` / `haproxy-abuja` forward only to the node whose Patroni `GET /primary` returns 200. Temporal, Keycloak and Permify (run in Abuja in the rehearsal) and the drill client use it, so they follow failover without config changes. `SPADE_DATABASE_URL` can point at the local site's HAProxy, or at both Postgres nodes with `target_session_attrs=read-write`.
+- **TigerBeetle:** 3 replicas, one per site (`TB_ADDRESSES=lagos:3000,abuja:3000,witness:3000`). Two sites alone can't survive losing the one holding the majority.
 - **Backups:** `backups-abuja` is the off-site copy target. Set `SPADE_BACKUP_REPLICA_REPO` on the worker and api (`BACKUP_OFFSITE=1 scripts/backup-repo-user.sh` prints it). After each backup and retention run, the worker runs `restic copy` to it.
 
-`scripts/e2e-ha.sh` is the drill. It writes continuously, kills the Lagos Postgres and TigerBeetle nodes, promotes Abuja (`scripts/ha-failover.sh`, which fences Lagos first), and checks that every acknowledged write survived. Then it rebuilds Lagos as Abuja's standby (`scripts/ha-rejoin.sh`). Promotion is manual; there is no automatic failover yet.
+`scripts/e2e-ha.sh` is the drill, with no operator step:
+1. Writes continuously to Postgres and TigerBeetle and starts a Temporal workflow whose timer spans the outage.
+2. Kills the whole Lagos site (Postgres leader, etcd member, TigerBeetle replica, HAProxy) and waits for Patroni to promote Abuja.
+3. Checks every acknowledged write survived, writes resumed, the workflow completed, and a Keycloak login and a Permify write + check work after failover.
+4. Restarts Lagos and checks it rejoins as Abuja's synchronous standby.
+5. Partitions the new leader (Abuja) off the network and checks it demotes itself while Lagos is promoted, then heals the partition and checks Abuja rejoins.
+
+Planned switchover: `docker compose -f deploy/ha/docker-compose.ha.yml exec pg-lagos patronictl -c /etc/patroni.yml switchover`.
 
 ### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack, Proxmox)
 All API providers share one adapter (`internal/providers/cloud`): servers are tagged with the service and enrolment attempt, so a retried deploy never creates a second server, stale attempts are removed, and deleting a service removes every server it owns. First boot (cloud-init, Ubuntu 24.04) locks the root password, installs Docker + Compose, WireGuard tools, restic and a pinned Nebula, then runs the embedded agent installer, which checks the gateway CA pin before downloading anything.

@@ -4,6 +4,9 @@
 //
 //	spade-hadrill run -for 60s -out drill.json   # write until the deadline, record acknowledged writes
 //	spade-hadrill verify -in drill.json          # every acknowledged row and transfer is present
+//
+// With -temporal host:port, run also starts a workflow whose durable timer spans the outage and
+// requires it to complete afterwards.
 package main
 
 import (
@@ -36,6 +39,9 @@ type result struct {
 	MaxTBGap      time.Duration `json:"max_tb_gap_ns"`
 	LastPGErr     string        `json:"last_pg_error,omitempty"`
 	LastTBErr     string        `json:"last_tb_error,omitempty"`
+	WorkflowID    string        `json:"workflow_id,omitempty"`
+	WorkflowOut   string        `json:"workflow_result,omitempty"`
+	WorkflowErr   string        `json:"workflow_error,omitempty"`
 }
 
 func randID() tb.Uint128 {
@@ -55,6 +61,7 @@ func main() {
 	dur := fs.Duration("for", 60*time.Second, "how long to write")
 	out := fs.String("out", "drill.json", "result file (run)")
 	in := fs.String("in", "drill.json", "result file (verify)")
+	tHost := fs.String("temporal", "", "Temporal frontend host:port; empty skips the workflow check")
 	_ = fs.Parse(os.Args[2:])
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, config.DatabaseURL())
@@ -68,7 +75,7 @@ func main() {
 	defer client.Close()
 	switch os.Args[1] {
 	case "run":
-		r, err := run(ctx, pool, client, *dur)
+		r, err := run(ctx, pool, client, *dur, *tHost)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -78,6 +85,9 @@ func main() {
 		}
 		fmt.Printf("acknowledged: postgres=%d tigerbeetle=%d; errors while failing over: postgres=%d tigerbeetle=%d; longest write gap: postgres=%s tigerbeetle=%s\n",
 			len(r.PGAcked), r.TBAcked, r.PGErrors, r.TBErrors, r.MaxPGGap.Round(time.Millisecond), r.MaxTBGap.Round(time.Millisecond))
+		if r.WorkflowID != "" {
+			fmt.Printf("temporal workflow %s: result=%q error=%q\n", r.WorkflowID, r.WorkflowOut, r.WorkflowErr)
+		}
 	case "verify":
 		b, err := os.ReadFile(*in)
 		if err != nil {
@@ -91,12 +101,15 @@ func main() {
 			log.Fatal("FAIL ", err)
 		}
 		fmt.Printf("no acknowledged write lost: %d postgres rows, %d tigerbeetle transfers\n", len(r.PGAcked), r.TBAcked)
+		if r.WorkflowID != "" {
+			fmt.Printf("temporal workflow %s completed across the failover\n", r.WorkflowID)
+		}
 	default:
 		log.Fatal("usage: spade-hadrill run|verify [flags]")
 	}
 }
 
-func run(ctx context.Context, pool *pgxpool.Pool, client tb.Client, dur time.Duration) (*result, error) {
+func run(ctx context.Context, pool *pgxpool.Pool, client tb.Client, dur time.Duration, temporalHost string) (*result, error) {
 	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS ha_drill (id bigint PRIMARY KEY, at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return nil, err
 	}
@@ -111,6 +124,14 @@ func run(ctx context.Context, pool *pgxpool.Pool, client tb.Client, dur time.Dur
 		}
 	}
 	r := &result{DebitID: dr.Bytes(), CreditID: cr.Bytes()}
+	var awaitWorkflow func(time.Duration) (string, error)
+	if temporalHost != "" {
+		id, await, err := temporalDrill(ctx, temporalHost, dur/2)
+		if err != nil {
+			return nil, fmt.Errorf("start temporal drill workflow: %w", err)
+		}
+		r.WorkflowID, awaitWorkflow = id, await
+	}
 	var seq [8]byte
 	if _, err := rand.Read(seq[:]); err != nil {
 		return nil, err
@@ -166,6 +187,13 @@ func run(ctx context.Context, pool *pgxpool.Pool, client tb.Client, dur time.Dur
 	}()
 	<-pgDone
 	<-tbDone
+	if awaitWorkflow != nil {
+		out, err := awaitWorkflow(2 * time.Minute)
+		r.WorkflowOut = out
+		if err != nil {
+			r.WorkflowErr = err.Error()
+		}
+	}
 	if len(r.PGAcked) == 0 || r.TBAcked == 0 {
 		return r, errors.New("no writes acknowledged at all: cluster never available")
 	}
@@ -173,6 +201,9 @@ func run(ctx context.Context, pool *pgxpool.Pool, client tb.Client, dur time.Dur
 }
 
 func verify(ctx context.Context, pool *pgxpool.Pool, client tb.Client, r *result) error {
+	if r.WorkflowID != "" && (r.WorkflowErr != "" || r.WorkflowOut != "survived") {
+		return fmt.Errorf("temporal workflow %s did not complete across the failover: %s", r.WorkflowID, r.WorkflowErr)
+	}
 	var missing int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM unnest($1::bigint[]) a(id) WHERE NOT EXISTS (SELECT 1 FROM ha_drill d WHERE d.id = a.id)`, r.PGAcked).Scan(&missing); err != nil {
 		return err
