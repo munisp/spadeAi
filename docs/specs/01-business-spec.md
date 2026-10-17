@@ -57,7 +57,7 @@ All prices are held in a **versioned price book** in Postgres (fixes W4) and cha
 | Backups | retention tied to plan; S3 external free | 7 / 14 / 30 days | same + "sovereign vault" add-on |
 | Bandwidth overage | per GB | $0.05–0.15 | per provider, from price book |
 | Object storage | GB-month + per-1k ops, free egress | $0.02/GB | local S3 (MinIO/Ceph RGW) pricing |
-| AI DevOps | credits per plan + paid extra session | 60/120/300; $1 extra | same structure; self-hosted LLM option |
+| AI DevOps | credits per plan + paid extra session | 60/120/300; $1 extra | same structure; dual LLM backends (self-hosted or external), chosen per org |
 | Domains | registrar resale | — | .ng via NiRA-accredited registrar partner |
 
 **Billing modes:** prepaid credits with auto-refill (Elestio default, E8), or **postpaid enterprise/government** (monthly invoice, credit limit, PO number, VAT 7.5%, WHT handling).
@@ -82,7 +82,7 @@ All prices are held in a **versioned price book** in Postgres (fixes W4) and cha
   - DPIA for AI DevOps
   - breach notification within 72h
   - data-subject rights
-  - cross-border transfer controls (keep the control plane in-country; LLM calls opt-in or self-hosted)
+  - cross-border transfer controls (keep the control plane in-country; external LLM calls only for orgs that enable them; self-hosted for residency-bound tenants)
 - **NITDA** cloud and hosting guidelines (local hosting for government data).
 - **CBN** risk-based cybersecurity framework, for fintech customers.
 - **Tax:** VAT 7.5% on invoices; FIRS e-invoicing readiness.
@@ -112,5 +112,5 @@ All prices are held in a **versioned price book** in Postgres (fixes W4) and cha
 | FX volatility vs USD-priced upstream clouds | Daily FX lock in the price book; prefer NGN-billed local DCs; hedge margin |
 | Local DC capacity and APIs immature | BYOVM and on-prem (Proxmox/OpenStack) drivers first; API drivers where available |
 | Licence changes upstream (BSL/SSPL apps) | Licence field per template; legal review gate; prefer OSI-approved |
-| Customer data exposure through support or AI | Just-in-time, customer-approved, recorded operator sessions; self-hosted LLM option |
+| Customer data exposure through support or AI | Just-in-time, customer-approved, recorded operator sessions; PII redaction before any LLM call; self-hosted backend enforced for residency-bound tenants |
 | Elestio IP | Clean-room: behaviour and public facts only; no copied code, assets or text; own template sources |

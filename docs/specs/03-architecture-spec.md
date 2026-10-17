@@ -50,7 +50,7 @@ flowchart TB
     CAT["Catalogue service (Go) + Template CI (Python)"]
     BILL["Rating + TigerBeetle relay (Go) / Metering (Rust)"]
     PAY["Payment adapters (TS): Paystack, Flutterwave, Remita, Stripe"]
-    AIO["AI DevOps service (Python): triage, policy-guarded PTY"]
+    AIO["AI DevOps service (Python): LLM router (self-hosted vLLM + external), triage, policy-guarded PTY"]
     NOTIF["Notifications (Go): email, SMS, web push, FCM/APNs"]
     OBS["Telemetry ingest (Rust)"]
     GW["Agent gateway (Go): gRPC mTLS, PTY relay"]
@@ -161,12 +161,15 @@ flowchart LR
 sequenceDiagram
   participant U as User
   participant AI as AI DevOps (Python)
-  participant LLM as LLM (self-hosted vLLM default; external opt-in per org)
+  participant R as LLM router (org ai_policy)
+  participant LLM as LLM backend (self-hosted vLLM or external)
   participant T as Temporal
   participant G as Gateway / agent PTY
   U->>AI: "Site returns 502"
-  AI->>LLM: context (metrics, logs excerpt, template meta; PII-redacted)
-  LLM-->>AI: diagnosis / needs shell?
+  AI->>R: context (metrics, logs excerpt, template meta; PII-redacted)
+  R->>LLM: route per policy (self_hosted | external | hybrid)
+  LLM-->>R: diagnosis / needs shell?
+  R-->>AI: result + backend/model/tokens (audited)
   alt answer-only
     AI-->>U: answer (1 credit)
   else needs shell
@@ -268,6 +271,6 @@ spadeai/
 |---|---|---|
 | 1 | Product name: **SpadeAi**; repo `munisp/spadeAi` | Decided |
 | 2 | Private network: **both Nebula and WireGuard**, selectable per project; the agent abstracts the overlay | Decided |
-| 3 | AI DevOps LLM: **self-hosted (vLLM, open-weight models) by default**; external providers opt-in per org, with a DPIA | Assumed (owner's answer was truncated; confirm) |
+| 3 | AI DevOps LLM: **runs on both**, self-hosted (vLLM, open-weight, in-country) and external providers, routed per org `ai_policy` (`self_hosted` / `external` / `hybrid`); residency-bound tenants locked to self-hosted | Decided |
 | 4 | Financial ledger: **TigerBeetle**; Postgres for everything else | Decided |
 | 5 | Legal entity, `.ng` registrar partner, first 2–3 Nigerian infrastructure partners | Open |
