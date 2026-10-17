@@ -4,7 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/munisp/spadeai/internal/providers/hetzner"
+	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"net"
 	"net/http"
@@ -164,16 +164,18 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 		p := p
 		c.Register("provider."+p, func(context.Context) (string, string) { return "unavailable", "driver not implemented" })
 	}
-	hz := &hetzner.Client{Token: os.Getenv("SPADE_HETZNER_TOKEN"), BaseURL: os.Getenv("SPADE_HETZNER_API")}
-	c.Register("provider.hetzner", func(ctx context.Context) (string, string) {
-		if hz.Token == "" {
-			return "unavailable", "SPADE_HETZNER_TOKEN not configured"
-		}
-		if err := hz.Ping(ctx); err != nil {
-			return "degraded", err.Error()
-		}
-		return "available", "servers are created outside Nigeria (no NG region); residency-locked orgs cannot use it"
-	})
+	for _, d := range registry.FromEnv() {
+		d := d
+		c.Register("provider."+d.Name(), func(ctx context.Context) (string, string) {
+			if !d.Configured() {
+				return "unavailable", d.TokenEnv() + " not configured"
+			}
+			if err := d.Ping(ctx); err != nil {
+				return "degraded", err.Error()
+			}
+			return "available", "servers are created outside Nigeria (no NG region); residency-locked orgs cannot use it"
+		})
+	}
 	c.Register("provider.byovm", func(context.Context) (string, string) { return "available", "" })
 	c.Register("overlay.wireguard", func(context.Context) (string, string) {
 		return "available", "hosts need the wireguard kernel module and wireguard-tools"

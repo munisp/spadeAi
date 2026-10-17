@@ -9,6 +9,7 @@ type Template = { slug: string; name: string; version: string; description: stri
 type Service = { id: string; display_name: string; template: string; state: string; state_reason: string | null };
 type OverlayPeer = { service_id: string; display_name: string; overlay_ip: string; endpoint: string; last_apply_status: string | null; applied_generation: number | null };
 type Backup = { id: string; kind: string; status: string; started_at: string; bytes_added: number | null; error: string | null };
+type Size = { id: string; provider_id: string; code: string; vcpu: number; ram_mb: number; disk_gb: number };
 type Overlay = { kind: string; cidr: string; generation: number; peers: OverlayPeer[] };
 
 const s = {
@@ -60,8 +61,12 @@ export function App() {
   };
   const deploy = async (t: Template) => {
     const name = prompt(`Name for ${t.name}`, t.slug); if (!name) return;
-    const hetzner = caps.find(c => c.component === "provider.hetzner")?.status === "available";
-    const size = prompt(`Size: byovm:SMALL-1C-2G | byovm:MEDIUM-2C-4G | byovm:LARGE-4C-8G${hetzner ? " | hetzner:CX22 | hetzner:CX32 | hetzner:CX42" : " (Hetzner unavailable)"}`, "byovm:SMALL-1C-2G"); if (!size) return;
+    const ready = (p: string) => p === "byovm" || caps.find(c => c.component === `provider.${p}`)?.status === "available";
+    const sizes = (await call<{ items: Size[] }>("/v1/sizes")).items ?? [];
+    const offered = sizes.filter(z => ready(z.provider_id)).map(z => z.id);
+    const missing = [...new Set(sizes.filter(z => !ready(z.provider_id)).map(z => z.provider_id))];
+    const size = prompt(`Size: ${offered.join(" | ")}${missing.length ? ` (unavailable: ${missing.join(", ")})` : ""}`, "byovm:SMALL-1C-2G"); if (!size) return;
+    if (!offered.includes(size)) throw new Error(`size ${size} is not offered by an available provider`);
     const op = await call<{ id: string }>(`/v1/projects/${project!.id}/services`, { method: "POST", idempotent: true, body: JSON.stringify({ template: t.slug, display_name: name, size }) });
     for (let i = 0; i < 30; i++) {
       const o = await call<{ status: string; response?: { bootstrap?: string }; error?: string }>(`/v1/operations/${op.id}`);

@@ -1,22 +1,23 @@
 package hetzner
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/munisp/spadeai/internal/providers/cloud/cloudtest"
 )
 
 // fakeAPI implements the slice of the Hetzner Cloud API the driver uses.
-func fakeAPI(t *testing.T) (*httptest.Server, *int) {
+func fakeAPI(t *testing.T) *httptest.Server {
 	var mu sync.Mutex
 	servers := map[int64]map[string]any{}
-	creates := 0
 	next := int64(100)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -25,8 +26,10 @@ func fakeAPI(t *testing.T) (*httptest.Server, *int) {
 			return
 		}
 		switch {
+		case r.Method == "GET" && r.URL.Path == "/locations":
+			_, _ = w.Write([]byte(`{"locations":[]}`))
 		case r.Method == "GET" && r.URL.Path == "/servers":
-			var out []any
+			out := []any{}
 			for _, s := range servers {
 				match := true
 				for _, kv := range strings.Split(r.URL.Query().Get("label_selector"), ",") {
@@ -41,10 +44,9 @@ func fakeAPI(t *testing.T) (*httptest.Server, *int) {
 		case r.Method == "POST" && r.URL.Path == "/servers":
 			var in map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&in)
-			if !strings.HasPrefix(in["user_data"].(string), "#cloud-config") {
-				t.Errorf("user_data is not cloud-init: %v", in["user_data"])
+			if !strings.HasPrefix(in["user_data"].(string), "#cloud-config") || in["server_type"] != "hetzner-size" || in["location"] != "fsn1" {
+				t.Errorf("bad create body: %v", in)
 			}
-			creates++
 			next++
 			s := map[string]any{"id": next, "name": in["name"], "status": "initializing", "labels": in["labels"],
 				"public_net": map[string]any{"ipv4": map[string]any{"ip": "203.0.113.7"}}}
@@ -52,80 +54,21 @@ func fakeAPI(t *testing.T) (*httptest.Server, *int) {
 			w.WriteHeader(201)
 			_ = json.NewEncoder(w).Encode(map[string]any{"server": s})
 		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/servers/"):
-			for id, s := range servers {
-				if "/servers/"+jsonNum(id) == r.URL.Path {
-					delete(servers, id)
-					_ = s
-					_, _ = w.Write([]byte(`{"action":{"id":1}}`))
-					return
-				}
+			id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/servers/"), 10, 64)
+			if _, ok := servers[id]; !ok {
+				w.WriteHeader(404)
+				return
 			}
-			w.WriteHeader(404)
+			delete(servers, id)
+			_, _ = w.Write([]byte(`{"action":{"id":1}}`))
 		default:
 			w.WriteHeader(404)
 		}
 	}))
-	return srv, &creates
 }
 
-func jsonNum(n int64) string { b, _ := json.Marshal(n); return string(b) }
-
-func TestEnsureIsIdempotentAndDeleteRemoves(t *testing.T) {
-	srv, creates := fakeAPI(t)
+func TestContract(t *testing.T) {
+	srv := fakeAPI(t)
 	defer srv.Close()
-	c := &Client{BaseURL: srv.URL, Token: "tok"}
-	ctx := context.Background()
-	o := CreateOpts{ServiceID: "0123456789abcdef", Attempt: "a1", ServerType: "cx22", Location: "fsn1", Image: "ubuntu-24.04", UserData: CloudInit(Boot{Run: "echo hi"})}
-	s1, created, err := c.Ensure(ctx, o)
-	if err != nil || !created || s1.IPv4 != "203.0.113.7" {
-		t.Fatalf("first ensure: %+v %v %v", s1, created, err)
-	}
-	s2, created, err := c.Ensure(ctx, o)
-	if err != nil || created || s2.ID != s1.ID || *creates != 1 {
-		t.Fatalf("retry must reuse the server: %+v %v %v creates=%d", s2, created, err, *creates)
-	}
-	o2 := o
-	o2.Attempt = "a2"
-	if s3, created, err := c.Ensure(ctx, o2); err != nil || !created || s3.ID == s1.ID {
-		t.Fatalf("new attempt must get a new server: %+v %v %v", s3, created, err)
-	}
-	if err := c.DeleteOthers(ctx, o.ServiceID, "a2"); err != nil {
-		t.Fatalf("delete others: %v", err)
-	}
-	if left, _ := c.list(ctx, Label(o.ServiceID)); len(left) != 1 || left[0].Labels["spade-attempt"] != "a2" {
-		t.Fatalf("only the current attempt's server may survive reconciliation: %+v", left)
-	}
-	if ok, err := c.Delete(ctx, o.ServiceID); err != nil || !ok {
-		t.Fatalf("delete: %v %v", ok, err)
-	}
-	if ok, err := c.Delete(ctx, o.ServiceID); err != nil || ok {
-		t.Fatalf("second delete must be a no-op: %v %v", ok, err)
-	}
-	if left, _ := c.list(ctx, Label(o.ServiceID)); len(left) != 0 {
-		t.Fatalf("delete must remove servers of every attempt, %d left", len(left))
-	}
-}
-
-func TestFailsClosedWithoutOrWithBadToken(t *testing.T) {
-	srv, _ := fakeAPI(t)
-	defer srv.Close()
-	if err := (&Client{BaseURL: srv.URL}).Ping(context.Background()); err == nil || !strings.Contains(err.Error(), "not configured") {
-		t.Fatalf("missing token must fail: %v", err)
-	}
-	if _, _, err := (&Client{BaseURL: srv.URL, Token: "wrong"}).Ensure(context.Background(), CreateOpts{ServiceID: "0123456789abcdef", Attempt: "a1"}); err == nil || !strings.Contains(err.Error(), "unauthorized") {
-		t.Fatalf("bad token must fail: %v", err)
-	}
-}
-
-func TestCloudInitQuotesBootstrap(t *testing.T) {
-	ci := CloudInit(Boot{Packages: []string{"docker.io"}, Files: map[string]string{"/opt/spade/install.sh": "#!/bin/sh\necho \"hi\"\n"},
-		Pre: []string{"echo pre"}, Run: `SPADE_X='1' sh /opt/spade/install.sh`})
-	for _, want := range []string{"packages:\n  - \"docker.io\"", `content: "#!/bin/sh\necho \"hi\"\n"`, `- [ sh, -c, "echo pre" ]`, `- [ sh, -c, "SPADE_X='1' sh /opt/spade/install.sh" ]`} {
-		if !strings.Contains(ci, want) {
-			t.Fatalf("cloud-init missing %q:\n%s", want, ci)
-		}
-	}
-	if strings.Index(ci, "echo pre") > strings.Index(ci, "install.sh\" ]") {
-		t.Fatalf("pre steps must run before the bootstrap:\n%s", ci)
-	}
+	cloudtest.Contract(t, &Client{BaseURL: srv.URL, Token: "tok"}, &Client{BaseURL: srv.URL, Token: "wrong"}, &Client{BaseURL: srv.URL})
 }

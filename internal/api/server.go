@@ -502,16 +502,17 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		if err := tx.QueryRow(r.Context(), q, in.Template, in.Version).Scan(&tvID); err != nil {
 			return fmt.Errorf("no tested version of template %q", in.Template)
 		}
-		var sizeOK, locked bool
-		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM size WHERE id=$1 AND provider_id=$2), o.residency_locked
-			FROM project pr JOIN organization o ON o.id=pr.org_id WHERE pr.id=$3`, in.Size, in.Provider, p).Scan(&sizeOK, &locked); err != nil {
+		var sizeOK, locked, inNigeria bool
+		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM size WHERE id=$1 AND provider_id=$2), o.residency_locked,
+			COALESCE((SELECT in_nigeria FROM provider WHERE id=$2), false)
+			FROM project pr JOIN organization o ON o.id=pr.org_id WHERE pr.id=$3`, in.Size, in.Provider, p).Scan(&sizeOK, &locked, &inNigeria); err != nil {
 			return err
 		}
 		if !sizeOK {
 			return fmt.Errorf("size %q is not offered by provider %q", in.Size, in.Provider)
 		}
-		if locked && in.Provider == "hetzner" {
-			return fmt.Errorf("residency-locked organizations cannot deploy to hetzner (no Nigerian region)")
+		if locked && !inNigeria {
+			return fmt.Errorf("residency-locked organizations cannot deploy to %s (no Nigerian region)", in.Provider)
 		}
 		if err := tx.QueryRow(r.Context(), `INSERT INTO service(project_id, template_version_id, display_name, provider_id, size_id, support_plan, env)
 			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id::text`, p, tvID, in.DisplayName, in.Provider, in.Size, in.SupportPlan, envJSON).Scan(&svcID); err != nil {

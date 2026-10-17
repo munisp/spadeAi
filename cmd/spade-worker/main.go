@@ -4,7 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/munisp/spadeai/internal/providers/hetzner"
+	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -65,8 +65,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	nebulaCert, _ := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert"))
 	acts.Overlay = &overlay.Controller{Pool: pool, KEK: kek, NebulaCert: nebulaCert}
 	acts.KEK = kek
-	acts.Hetzner = &hetzner.Client{Token: os.Getenv("SPADE_HETZNER_TOKEN"), BaseURL: os.Getenv("SPADE_HETZNER_API")}
-	acts.HetznerLocation = config.Get("SPADE_HETZNER_LOCATION", "fsn1")
+	acts.Clouds = registry.ByName(registry.FromEnv())
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)
