@@ -32,10 +32,13 @@ def test_rejects_host_mounts_and_namespace_sharing(tmp_path):
     (d / "docker-compose.yml").write_text(
         "services:\n  app:\n    image: nginx:1.27\n    network_mode: host\n    cap_add: [SYS_ADMIN]\n"
         "    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - ./data:/data\n"
-        "      - {type: bind, source: /etc, target: /host-etc}\n      - data:/ok\n"
+        "      - {type: bind, source: /etc, target: /host-etc}\n      - data:/ok\n      - etc/x:/rel\n"
+        "      - undeclared:/u\n      - /anon\n"
         "volumes:\n  data: {}\n  sneaky: {driver_opts: {type: none, o: bind, device: /}}\n")
     errs = validate(load(d))
-    assert sum("bind" in e for e in errs) >= 3, errs
+    assert sum("bind" in e for e in errs) >= 5, errs
+    assert any("etc/x" in e for e in errs) and any("undeclared" in e for e in errs)
+    assert not any("/anon" in e for e in errs)
     assert any("network_mode" in e for e in errs)
     assert any("cap_add" in e for e in errs)
     assert any("sneaky" in e for e in errs)

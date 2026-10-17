@@ -184,6 +184,7 @@ func (s *Server) createOrg(w http.ResponseWriter, r *http.Request) {
 	}
 	u := userFrom(r.Context())
 	var orgID string
+	var granted []authz.Tuple
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
 		if err := tx.QueryRow(r.Context(), `INSERT INTO organization(name,billing_mode,ai_policy,residency_locked) VALUES ($1,$2,$3,$4) RETURNING id::text`,
 			in.Name, in.BillingMode, in.AIPolicy, in.ResidencyLocked).Scan(&orgID); err != nil {
@@ -196,11 +197,16 @@ func (s *Server) createOrg(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		// Last step before commit: if Permify is down the org is rolled back, so a retry starts clean.
-		if err := s.Authz.Write(r.Context(), authz.T("organization", orgID, "owner", "user", u.ID)); err != nil {
+		t := authz.T("organization", orgID, "owner", "user", u.ID)
+		if err := s.Authz.Write(r.Context(), t); err != nil {
 			return errAuthz{err}
 		}
+		granted = append(granted, t)
 		return nil
 	})
+	if err != nil {
+		s.revoke(granted) // commit failed after the grant: keep Permify in step with the rolled-back DB
+	}
 	if writeTxErr(w, err, "create_failed") {
 		return
 	}
@@ -265,6 +271,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	u := userFrom(r.Context())
 	var id string
+	var granted []authz.Tuple
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
 		if err := tx.QueryRow(r.Context(), `INSERT INTO project(org_id,name,technical_email,overlay_kind) VALUES ($1,$2,$3,$4) RETURNING id::text`,
 			org, in.Name, in.TechnicalEmail, in.Overlay).Scan(&id); err != nil {
@@ -276,11 +283,16 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		if err := audit.Append(r.Context(), tx, audit.Event{Actor: u.ID, Verb: "project.create", TargetKind: "project", TargetID: id, Detail: map[string]any{"org_id": org, "overlay": in.Overlay}}); err != nil {
 			return err
 		}
-		if err := s.Authz.Write(r.Context(), authz.T("project", id, "org", "organization", org), authz.T("project", id, "owner", "user", u.ID)); err != nil {
+		ts := []authz.Tuple{authz.T("project", id, "org", "organization", org), authz.T("project", id, "owner", "user", u.ID)}
+		if err := s.Authz.Write(r.Context(), ts...); err != nil {
 			return errAuthz{err}
 		}
+		granted = ts
 		return nil
 	})
+	if err != nil {
+		s.revoke(granted)
+	}
 	if writeTxErr(w, err, "create_failed") {
 		return
 	}
@@ -310,8 +322,9 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "user_not_found", "user must sign in once before being added")
 		return
 	}
+	var prev string
+	var changed bool
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
-		var prev string
 		if err := tx.QueryRow(r.Context(), `SELECT role FROM membership WHERE user_id=$1 AND project_id=$2 FOR UPDATE`, uid, p).Scan(&prev); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -324,20 +337,28 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 		if err := audit.Append(r.Context(), tx, audit.Event{Actor: userFrom(r.Context()).ID, Verb: "project.member.add", TargetKind: "project", TargetID: p, Detail: map[string]any{"user_id": uid, "role": in.Role, "previous_role": prev}}); err != nil {
 			return err
 		}
-		// Exactly one role tuple per member: drop every other role so a demotion removes old privileges.
-		for role := range valid {
-			if role == in.Role {
-				continue
-			}
-			if err := s.Authz.Delete(r.Context(), authz.T("project", p, role, "user", uid)); err != nil {
-				return errAuthz{err}
-			}
+		// Exactly one role tuple per member. One atomic delete drops every role the user held, so a
+		// failure part-way can only leave less access (fail closed), never the old privileges plus the new.
+		if err := s.Authz.DeleteSubject(r.Context(), "project", p, "user", uid); err != nil {
+			return errAuthz{err}
 		}
+		changed = true
 		if err := s.Authz.Write(r.Context(), authz.T("project", p, in.Role, "user", uid)); err != nil {
 			return errAuthz{err}
 		}
 		return nil
 	})
+	if err != nil && changed {
+		// The DB rolled back to the previous role; restore exactly that in Permify (best effort).
+		ctx := context.WithoutCancel(r.Context())
+		if derr := s.Authz.DeleteSubject(ctx, "project", p, "user", uid); derr != nil {
+			s.Log.Error("authz restore after failed member change", "project", p, "user", uid, "err", derr)
+		} else if prev != "" {
+			if werr := s.Authz.Write(ctx, authz.T("project", p, prev, "user", uid)); werr != nil {
+				s.Log.Error("authz restore after failed member change", "project", p, "user", uid, "err", werr)
+			}
+		}
+	}
 	if writeTxErr(w, err, "failed") {
 		return
 	}
@@ -650,6 +671,15 @@ func (s *Server) ensureWallet(ctx context.Context, org, currency string) error {
 	}
 	_, err := s.Ledger.EnsureAccount(ctx, "org_wallet", org, currency, mode == "prepaid")
 	return err
+}
+
+// revoke best-effort removes grants written inside a transaction that then failed to commit.
+func (s *Server) revoke(ts []authz.Tuple) {
+	for _, t := range ts {
+		if err := s.Authz.Delete(context.Background(), t); err != nil {
+			s.Log.Error("authz revoke after failed commit", "entity", t.EntityType, "id", t.EntityID, "relation", t.Relation, "err", err)
+		}
+	}
 }
 
 func writeTxErr(w http.ResponseWriter, err error, kind string) bool {
