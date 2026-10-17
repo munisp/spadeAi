@@ -38,7 +38,9 @@ func (r *Rater) Loop(ctx context.Context, every time.Duration) {
 }
 
 // Price converts milli-units × milli-kobo-per-unit into kobo, rounding half up.
-func Price(quantityMilli, priceMilliKobo int64) int64 { return (quantityMilli*priceMilliKobo + 500_000) / 1_000_000 }
+func Price(quantityMilli, priceMilliKobo int64) int64 {
+	return (quantityMilli*priceMilliKobo + 500_000) / 1_000_000
+}
 
 func VAT(net int64) int64 { return (net*VATBasisPoints + 5_000) / 10_000 }
 

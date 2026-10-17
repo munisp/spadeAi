@@ -74,7 +74,7 @@ def smoke_test(t: Template, timeout: float = 180.0) -> dict:
     base = ["docker", "compose", "-p", project, "-f", str(compose_file)]
     report: dict = {"started_at": time.time(), "passed": False}
     try:
-        up = subprocess.run(base + ["up", "-d", "--quiet-pull"], capture_output=True, text=True, timeout=600)
+        up = subprocess.run(base + ["up", "-d", "--quiet-pull"], capture_output=True, text=True, timeout=600, check=False)
         if up.returncode != 0:
             report["error"] = up.stderr[-2000:]
             return report
@@ -96,7 +96,7 @@ def smoke_test(t: Template, timeout: float = 180.0) -> dict:
         report["error"] = f"health probe {url} did not return {sorted(expect)} (last: {last})"
         return report
     finally:
-        subprocess.run(base + ["down", "-v", "--remove-orphans"], capture_output=True, text=True, timeout=300)
+        subprocess.run(base + ["down", "-v", "--remove-orphans"], capture_output=True, text=True, timeout=300, check=False)
         report["finished_at"] = time.time()
 
 
@@ -128,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("templates", nargs="*", default=None, help="template dirs (default: all under templates/)")
     ap.add_argument("--root", default=os.environ.get("SPADE_TEMPLATES", "templates"))
     ap.add_argument("--smoke", action="store_true", help="run docker compose smoke test")
-    ap.add_argument("--publish", action="store_true", help="write to Postgres (DATABASE_URL)")
+    ap.add_argument("--publish", action="store_true", help="write to Postgres (SPADE_DATABASE_URL)")
     args = ap.parse_args(argv)
     root = pathlib.Path(args.root)
     dirs = [pathlib.Path(d) for d in args.templates] if args.templates else sorted(p for p in root.iterdir() if p.is_dir())
@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                 errs.append(report.get("error", "smoke test failed"))
         print(json.dumps({"template": d.name, "ok": not errs, "errors": errs, "smoke": report}))
         if args.publish and not validate(t):
-            dsn = os.environ.get("DATABASE_URL", "postgresql://spade:spade-local-dev@localhost:5433/spadeai")
+            dsn = os.environ.get("SPADE_DATABASE_URL", "postgresql://spade:spade-local-dev@localhost:5433/spadeai")
             publish(t, dsn, report)
         failed += bool(errs)
     return 1 if failed else 0

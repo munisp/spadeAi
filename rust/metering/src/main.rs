@@ -55,7 +55,7 @@ async fn meter_hour(db: &Client, hour: DateTime<Utc>, now: DateTime<Utc>) -> Res
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let url = std::env::var("DATABASE_URL").unwrap_or("postgres://spade:spade-local-dev@localhost:5433/spadeai".into());
+    let url = std::env::var("SPADE_DATABASE_URL").unwrap_or("postgres://spade:spade-local-dev@localhost:5433/spadeai".into());
     let (db, conn) = tokio_postgres::connect(&url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {

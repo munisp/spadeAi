@@ -53,7 +53,9 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(cors)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	r.Get("/v1/capabilities", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]any{"capabilities": s.Caps.Snapshot()}) })
+	r.Get("/v1/capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, 200, map[string]any{"capabilities": s.Caps.Snapshot()})
+	})
 	r.Get("/v1/templates", s.listTemplates)
 	r.Get("/v1/sizes", s.listSizes)
 	r.Post("/internal/payments/verified", s.paymentVerified)

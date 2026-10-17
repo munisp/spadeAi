@@ -93,7 +93,9 @@ func (l *Ledger) PlatformAccounts(ctx context.Context, currency string) (revenue
 	return
 }
 
-func WalletID(orgID, currency string) *big.Int { return ids.U128("account", "org_wallet", orgID, currency) }
+func WalletID(orgID, currency string) *big.Int {
+	return ids.U128("account", "org_wallet", orgID, currency)
+}
 
 type Balance struct {
 	Currency  string `json:"currency"`
@@ -145,9 +147,9 @@ func Enqueue(ctx context.Context, tx pgx.Tx, in ...Intent) error {
 
 // RelayResult summarises one outbox relay pass.
 type RelayResult struct {
-	Committed  int
-	Unpaid     []string // org ids whose prepaid debit was rejected with exceeds_credits
-	Failed     int
+	Committed int
+	Unpaid    []string // org ids whose prepaid debit was rejected with exceeds_credits
+	Failed    int
 }
 
 // Relay submits pending intents to TigerBeetle. Deterministic IDs make retries safe (TransferExists == committed).
@@ -162,7 +164,10 @@ func (l *Ledger) Relay(ctx context.Context, limit int) (*RelayResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	type row struct{ id, kind, org, dr, cr, cur string; amt int64 }
+	type row struct {
+		id, kind, org, dr, cr, cur string
+		amt                        int64
+	}
 	var batch []row
 	for rows.Next() {
 		var r row

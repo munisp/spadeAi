@@ -24,7 +24,9 @@ func Int(k string, def int64) int64 {
 func List(k, def string) []string { return strings.Split(Get(k, def), ",") }
 
 var (
-	DatabaseURL = func() string { return Get("DATABASE_URL", "postgres://spade:spade-local-dev@localhost:5433/spadeai?sslmode=disable") }
+	DatabaseURL = func() string {
+		return Get("SPADE_DATABASE_URL", "postgres://spade:spade-local-dev@localhost:5433/spadeai?sslmode=disable")
+	}
 	TBAddresses = func() []string { return List("TB_ADDRESSES", "3001") }
 	Temporal    = func() string { return Get("TEMPORAL_HOSTPORT", "localhost:7233") }
 	OIDCIssuer  = func() string { return Get("OIDC_ISSUER", "http://localhost:8180/realms/spadeai") }
