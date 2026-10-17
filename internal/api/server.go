@@ -211,7 +211,7 @@ func (s *Server) createOrg(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		s.revoke(granted) // commit failed after the grant: keep Permify in step with the rolled-back DB
+		s.revokeIfAbsent("organization", orgID, granted)
 	}
 	if writeTxErr(w, err, "create_failed") {
 		return
@@ -297,7 +297,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		s.revoke(granted)
+		s.revokeIfAbsent("project", id, granted)
 	}
 	if writeTxErr(w, err, "create_failed") {
 		return
@@ -331,6 +331,11 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 	var prev string
 	var changed bool
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
+		// Every Permify change for this (project, user) happens under this lock, so concurrent member
+		// updates and failure reconciliation cannot interleave.
+		if err := lockMember(r.Context(), tx, p, uid); err != nil {
+			return err
+		}
 		if err := tx.QueryRow(r.Context(), `SELECT role FROM membership WHERE user_id=$1 AND project_id=$2 FOR UPDATE`, uid, p).Scan(&prev); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -355,15 +360,7 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && changed {
-		// The DB rolled back to the previous role; restore exactly that in Permify (best effort).
-		ctx := context.WithoutCancel(r.Context())
-		if derr := s.Authz.DeleteSubject(ctx, "project", p, "user", uid); derr != nil {
-			s.Log.Error("authz restore after failed member change", "project", p, "user", uid, "err", derr)
-		} else if prev != "" {
-			if werr := s.Authz.Write(ctx, authz.T("project", p, prev, "user", uid)); werr != nil {
-				s.Log.Error("authz restore after failed member change", "project", p, "user", uid, "err", werr)
-			}
-		}
+		s.reconcileMember(context.WithoutCancel(r.Context()), p, uid)
 	}
 	if writeTxErr(w, err, "failed") {
 		return
@@ -776,6 +773,51 @@ func (s *Server) ensureWallet(ctx context.Context, org, currency string) error {
 	}
 	_, err := s.Ledger.EnsureAccount(ctx, "org_wallet", org, currency, mode == "prepaid")
 	return err
+}
+
+func lockMember(ctx context.Context, tx pgx.Tx, project, user string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7426003, hashtext($1 || ':' || $2))`, project, user)
+	return err
+}
+
+// reconcileMember makes Permify match the member's *committed* role, read under the member lock, so a
+// failed update can never restore a role that a concurrent request has since changed.
+func (s *Server) reconcileMember(ctx context.Context, project, user string) {
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if err := lockMember(ctx, tx, project, user); err != nil {
+			return err
+		}
+		var role string
+		if err := tx.QueryRow(ctx, `SELECT role FROM membership WHERE user_id=$1 AND project_id=$2`, user, project).Scan(&role); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err := s.Authz.DeleteSubject(ctx, "project", project, "user", user); err != nil {
+			return err
+		}
+		if role == "" {
+			return nil
+		}
+		return s.Authz.Write(ctx, authz.T("project", project, role, "user", user))
+	})
+	if err != nil {
+		s.Log.Error("authz reconcile after failed member change; access may be reduced until the next change", "project", project, "user", user, "err", err)
+	}
+}
+
+// revokeIfAbsent undoes grants only when the row provably does not exist: a commit whose reply was
+// lost may still have succeeded, and revoking then would orphan the creator's own resource.
+func (s *Server) revokeIfAbsent(table, id string, ts []authz.Tuple) {
+	if len(ts) == 0 {
+		return
+	}
+	var exists bool
+	if err := s.Pool.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM `+table+` WHERE id=$1)`, id).Scan(&exists); err != nil || exists {
+		if err != nil {
+			s.Log.Warn("cannot confirm rollback; keeping grants", "table", table, "id", id, "err", err)
+		}
+		return
+	}
+	s.revoke(ts)
 }
 
 // revoke best-effort removes grants written inside a transaction that then failed to commit.

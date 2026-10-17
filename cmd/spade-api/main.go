@@ -44,6 +44,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
+	// The residency check reads provider.in_nigeria; keep it in step with each driver's configuration so
+	// an operator declaration (or its removal) takes effect on restart.
+	for _, d := range registry.FromEnv() {
+		if _, err := pool.Exec(ctx, `UPDATE provider SET in_nigeria = $2 WHERE id = $1`, d.Name(), d.InNigeria()); err != nil {
+			return fmt.Errorf("provider %s residency: %w", d.Name(), err)
+		}
+	}
 	tbc, err := ledger.Connect(0, config.TBAddresses())
 	if err != nil {
 		return fmt.Errorf("tigerbeetle: %w", err)
@@ -160,10 +167,6 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 			return "available", ""
 		})
 	}
-	for _, p := range []string{"aws", "proxmox", "openstack"} {
-		p := p
-		c.Register("provider."+p, func(context.Context) (string, string) { return "unavailable", "driver not implemented" })
-	}
 	for _, d := range registry.FromEnv() {
 		d := d
 		c.Register("provider."+d.Name(), func(ctx context.Context) (string, string) {
@@ -172,6 +175,9 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 			}
 			if err := d.Ping(ctx); err != nil {
 				return "degraded", err.Error()
+			}
+			if d.InNigeria() {
+				return "available", "operator-declared Nigerian hosting; residency-locked orgs may use it"
 			}
 			return "available", "servers are created outside Nigeria (no NG region); residency-locked orgs cannot use it"
 		})

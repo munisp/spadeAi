@@ -6,6 +6,7 @@ package cloud
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,13 +25,17 @@ type Server struct {
 }
 
 type CreateOpts struct {
-	ServiceID, Attempt, Size, UserData string
+	ServiceID, Attempt, Size string
+	UserData                 string // cloud-config, for providers that take user data at create
+	Script                   string // the same first boot as a shell script, for providers that run it in the guest
 }
 
 type Driver interface {
 	Name() string
 	TokenEnv() string
 	Configured() bool
+	// InNigeria reports whether servers are created in Nigeria; residency-locked orgs need it.
+	InNigeria() bool
 	Ping(ctx context.Context) error
 	// List returns only servers tagged for serviceID, across all attempts.
 	List(ctx context.Context, serviceID string) ([]Server, error)
@@ -209,3 +214,34 @@ func CloudInit(b Boot) string {
 	}
 	return sb.String()
 }
+
+// Script renders Boot as a POSIX shell script for providers without user data (Proxmox guest agent).
+// It stops at the first failing step; every value is single-quoted.
+func Script(b Boot) string {
+	var sb strings.Builder
+	sb.WriteString("#!/bin/sh\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n")
+	if len(b.Packages) > 0 {
+		sb.WriteString("apt-get update -q\napt-get install -yq")
+		for _, p := range b.Packages {
+			sb.WriteString(" " + ShellQuote(p))
+		}
+		sb.WriteString("\n")
+	}
+	paths := make([]string, 0, len(b.Files))
+	for p := range b.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		sb.WriteString("mkdir -p \"$(dirname " + ShellQuote(p) + ")\"\n")
+		sb.WriteString("printf '%s' " + ShellQuote(base64.StdEncoding.EncodeToString([]byte(b.Files[p]))) + " | base64 -d > " + ShellQuote(p) + "\n")
+		sb.WriteString("chmod 0700 " + ShellQuote(p) + "\n")
+	}
+	for _, c := range append(append([]string{}, b.Pre...), b.Run) {
+		sb.WriteString("sh -c " + ShellQuote(c) + "\n")
+	}
+	return sb.String()
+}
+
+// ShellQuote single-quotes v for POSIX sh.
+func ShellQuote(v string) string { return "'" + strings.ReplaceAll(v, "'", `'"'"'`) + "'" }

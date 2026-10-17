@@ -219,14 +219,14 @@ func (a *Activities) provisionCloud(ctx context.Context, d cloud.Driver, service
 	run := fmt.Sprintf("SPADE_GATEWAY='%s' SPADE_CA_SHA256='%s' SPADE_ENROL_TOKEN='%s' sh /opt/spade/install.sh", a.GatewayURL, a.CAPin, token)
 	boot := cloud.Boot{Packages: hostPackages, Files: map[string]string{"/opt/spade/install.sh": gateway.InstallScript()},
 		Pre: []string{"passwd -l root", "systemctl enable --now docker", nebulaInstall}, Run: run}
-	srv, _, err := cloud.Ensure(ctx, d, cloud.CreateOpts{ServiceID: serviceID, Attempt: attempt, Size: code, UserData: cloud.CloudInit(boot)})
+	srv, _, err := cloud.Ensure(ctx, d, cloud.CreateOpts{ServiceID: serviceID, Attempt: attempt, Size: code, UserData: cloud.CloudInit(boot), Script: cloud.Script(boot)})
 	if err != nil {
 		return nil, err
 	}
 	if _, err := a.Pool.Exec(ctx, `UPDATE service SET provider_ref=$2 WHERE id=$1`, serviceID, srv.ID); err != nil {
 		return nil, err
 	}
-	return &ProvisionResult{Bootstrap: fmt.Sprintf("%s server %s (%s) installs the agent via cloud-init", d.Name(), srv.Name, srv.IPv4), EnrolExpiresAt: exp}, nil
+	return &ProvisionResult{Bootstrap: fmt.Sprintf("%s server %s (%s) installs the agent on first boot", d.Name(), srv.Name, srv.IPv4), EnrolExpiresAt: exp}, nil
 }
 
 // Deprovision deletes provider infrastructure for API providers; BYOVM hosts belong to the customer.
