@@ -63,14 +63,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	nebulaCert, _ := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert"))
 	acts.Overlay = &overlay.Controller{Pool: pool, KEK: kek, NebulaCert: nebulaCert}
+	acts.KEK = kek
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)
 	w.RegisterWorkflow(workflows.SuspendOrg)
 	w.RegisterWorkflow(workflows.ResumeOrg)
+	w.RegisterWorkflow(workflows.BackupService)
+	w.RegisterWorkflow(workflows.RestoreService)
 	w.RegisterActivity(acts)
 	rater := &workflows.Rater{A: acts, Temporal: tc, Log: log}
 	go rater.Loop(ctx, time.Duration(config.Int("SPADE_RATING_INTERVAL_SEC", 60))*time.Second)
+	sched := &workflows.BackupScheduler{A: acts, Temporal: tc, Log: log}
+	go sched.Loop(ctx, time.Duration(config.Int("SPADE_BACKUP_SCHEDULE_SEC", 3600))*time.Second)
 	log.Info("spade-worker started", "task_queue", workflows.TaskQueue)
 	return w.Run(worker.InterruptCh())
 }

@@ -18,9 +18,11 @@ import (
 	"github.com/munisp/spadeai/internal/audit"
 	"github.com/munisp/spadeai/internal/ledger"
 	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/secrets"
 )
 
 type Activities struct {
+	KEK       *secrets.KEK        // seals per-service backup passwords; nil disables backups (fail closed)
 	Overlay   *overlay.Controller // nil disables private networks (deploys into projects then fail closed)
 	Pool      *pgxpool.Pool
 	Ledger    *ledger.Ledger
@@ -35,6 +37,9 @@ func nonRetryable(format string, args ...any) error {
 }
 
 func (a *Activities) MarkOperation(ctx context.Context, opID, status, workflowID, errMsg string, response map[string]any) error {
+	if opID == "" {
+		return nil // system-initiated workflow (e.g. scheduled backup) without a user operation
+	}
 	var resp any
 	if response != nil {
 		b, _ := json.Marshal(response)
@@ -368,4 +373,83 @@ func (a *Activities) OverlayRemove(ctx context.Context, serviceID string) (strin
 		return "", nil
 	}
 	return a.Overlay.Remove(ctx, serviceID)
+}
+
+// EnsureBackupConfig creates the service's restic password (random, sealed with the KEK) on first use.
+func (a *Activities) EnsureBackupConfig(ctx context.Context, serviceID string) error {
+	if a.KEK == nil {
+		return nonRetryable("backups unavailable: KEK not configured")
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return err
+	}
+	sealed, err := a.KEK.Seal([]byte(hex.EncodeToString(raw)), "backup:"+serviceID)
+	if err != nil {
+		return err
+	}
+	_, err = a.Pool.Exec(ctx, `INSERT INTO service_backup_config(service_id,password_sealed) VALUES ($1,$2) ON CONFLICT (service_id) DO NOTHING`, serviceID, sealed)
+	return err
+}
+
+// QueueBackupCommand queues backup_run/backup_restore carrying only a secret_ref; the gateway injects the
+// repository credentials at delivery.
+func (a *Activities) QueueBackupCommand(ctx context.Context, serviceID, verb, snapshot string) (string, error) {
+	var agentID string
+	var keep int
+	var manifest []byte
+	err := a.Pool.QueryRow(ctx, `SELECT a.id::text, c.keep_daily, tv.manifest FROM service s JOIN template_version tv ON tv.id=s.template_version_id
+		JOIN agent a ON a.service_id=s.id JOIN service_backup_config c ON c.service_id=s.id WHERE s.id=$1 AND a.cert_fingerprint IS NOT NULL`, serviceID).Scan(&agentID, &keep, &manifest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nonRetryable("service %s has no enrolled agent or backup config", serviceID)
+	}
+	if err != nil {
+		return "", err
+	}
+	quiesce := true
+	var m map[string]any
+	_ = json.Unmarshal(manifest, &m)
+	if b, ok := m["backup"].(map[string]any); ok {
+		if q, ok := b["quiesce"].(bool); ok {
+			quiesce = q
+		}
+	}
+	payload := map[string]any{"project": "spade-" + serviceID[:8], "secret_ref": map[string]string{"kind": "backup", "service_id": serviceID},
+		"keep_daily": keep, "quiesce": quiesce}
+	if verb == "backup_restore" {
+		payload["snapshot"] = snapshot
+	}
+	b, _ := json.Marshal(payload)
+	var id string
+	err = a.Pool.QueryRow(ctx, `INSERT INTO agent_command(agent_id, verb, payload, expires_at) VALUES ($1,$2,$3, now() + interval '1 hour') RETURNING id::text`, agentID, verb, b).Scan(&id)
+	return id, err
+}
+
+func (a *Activities) BackupRecord(ctx context.Context, serviceID, opID, kind, restoredFrom string) (string, error) {
+	var id string
+	err := a.Pool.QueryRow(ctx, `INSERT INTO backup_snapshot(service_id, operation_id, kind, restored_from) VALUES ($1, nullif($2,'')::uuid, $3, nullif($4,'')::uuid) RETURNING id::text`,
+		serviceID, opID, kind, restoredFrom).Scan(&id)
+	return id, err
+}
+
+// BackupFinish records the outcome; for backups the restic snapshot id and bytes come from the agent result.
+func (a *Activities) BackupFinish(ctx context.Context, recordID, cmdID, errMsg string) error {
+	if errMsg != "" {
+		_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot SET status='failed', error=$2, finished_at=now() WHERE id=$1`, recordID, errMsg)
+		return err
+	}
+	_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot b SET status='succeeded', finished_at=now(), restic_snapshot_id=c.result->>'snapshot_id',
+		bytes_added=(c.result->>'bytes_added')::bigint FROM agent_command c WHERE b.id=$1 AND c.id=$2`, recordID, cmdID)
+	return err
+}
+
+// BackupSnapshotID resolves a succeeded backup of this service to its restic snapshot id.
+func (a *Activities) BackupSnapshotID(ctx context.Context, serviceID, backupID string) (string, error) {
+	var snap string
+	err := a.Pool.QueryRow(ctx, `SELECT restic_snapshot_id FROM backup_snapshot WHERE id=$1 AND service_id=$2 AND kind='backup' AND status='succeeded' AND restic_snapshot_id IS NOT NULL`,
+		backupID, serviceID).Scan(&snap)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nonRetryable("backup %s is not a completed backup of service %s", backupID, serviceID)
+	}
+	return snap, err
 }

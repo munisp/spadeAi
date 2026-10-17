@@ -8,6 +8,7 @@ type Project = { id: string; name: string; org_id: string; overlay_kind?: string
 type Template = { slug: string; name: string; version: string; description: string };
 type Service = { id: string; display_name: string; template: string; state: string; state_reason: string | null };
 type OverlayPeer = { service_id: string; display_name: string; overlay_ip: string; endpoint: string; last_apply_status: string | null; applied_generation: number | null };
+type Backup = { id: string; kind: string; status: string; started_at: string; bytes_added: number | null; error: string | null };
 type Overlay = { kind: string; cidr: string; generation: number; peers: OverlayPeer[] };
 
 const s = {
@@ -30,6 +31,7 @@ export function App() {
   const [services, setServices] = useState<Service[]>([]);
   const [bootstrap, setBootstrap] = useState("");
   const [overlay, setOverlay] = useState<Overlay | null>(null);
+  const [backups, setBackups] = useState<{ svc: string; items: Backup[] } | null>(null);
 
   const guard = (f: () => Promise<void>) => () => { setErr(""); f().catch(e => setErr(String(e.message ?? e))); };
 
@@ -68,6 +70,12 @@ export function App() {
     await openProject(project!);
   };
   const act = async (svc: Service, a: string) => { await call(`/v1/services/${svc.id}/actions/${a}`, { method: "POST", idempotent: true }); await openProject(project!); };
+  const showBackups = async (v: Service) => setBackups({ svc: v.id, items: (await call<{ items: Backup[] }>(`/v1/services/${v.id}/backups`)).items ?? [] });
+  const backupNow = async (v: Service) => { await call(`/v1/services/${v.id}/backups`, { method: "POST", idempotent: true }); await showBackups(v); };
+  const restore = async (svc: string, b: Backup) => {
+    if (!confirm("Restore replaces the service's current data with this backup. Continue?")) return;
+    await call(`/v1/services/${svc}/backups/${b.id}/restore`, { method: "POST", idempotent: true });
+  };
   const topup = async () => {
     const amt = Number(prompt("Top-up amount in naira", "5000")); if (!amt) return;
     const r = await call<{ authorizationUrl: string }>("/v1/topups", { base: PAYMENTS, method: "POST", body: JSON.stringify({ org_id: org!.id, provider: "paystack", amount_minor: Math.round(amt * 100), email: user }) });
@@ -116,6 +124,15 @@ export function App() {
         {services.map(v => <div key={v.id} style={{ marginBottom: 6 }}>
           <b>{v.display_name}</b> ({v.template}) <span style={s.pill(v.state === "running")}>{v.state}</span> {v.state_reason && <small>{v.state_reason}</small>}
           {["start", "stop", "restart", "delete"].map(a => <button key={a} style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => act(v, a))}>{a}</button>)}
+          <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => backupNow(v))}>back up</button>
+          <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => showBackups(v))}>backups</button>
+          {backups?.svc === v.id && <div style={{ marginLeft: 16 }}>
+            {backups.items.length === 0 && <small>No backups yet.</small>}
+            {backups.items.map(b => <div key={b.id}><small>{b.kind} {new Date(b.started_at).toLocaleString()} </small>
+              <span style={s.pill(b.status === "succeeded")}>{b.status}</span> {b.error && <small>{b.error}</small>}
+              {b.kind === "backup" && b.status === "succeeded" && <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => restore(v.id, b))}>restore</button>}
+            </div>)}
+          </div>}
         </div>)}
         {overlay && <div style={{ marginTop: 8 }}>
           <h4>Private network ({overlay.kind}, {overlay.cidr})</h4>

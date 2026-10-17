@@ -300,11 +300,139 @@ async fn execute(cmd: &Command_, stacks: &Path, env: &Env<'_>) -> Result<Value> 
         "compose_restart" => compose(&dir, &project, &["restart"]).await,
         "health_probe" => health(&cmd.payload["health"]).await,
         "collect_metrics" => compose(&dir, &project, &["ps", "--format", "json"]).await,
+        "backup_run" => backup_run(&cmd.payload, &dir, &project).await,
+        "backup_restore" => backup_restore(&cmd.payload, &dir, &project).await,
         "overlay_keygen" => overlay_keygen(&cmd.payload, env).await,
         "overlay_apply" => overlay_apply(&cmd.payload, env.state).await,
         "overlay_down" => overlay_down(&cmd.payload, env.state).await,
         other => bail!("unsupported verb {other}"),
     }
+}
+
+// ---- backups (restic) ----
+// Repository URL and password arrive only in the delivered command (injected by the gateway) and are
+// passed to restic via its environment; they are never written to disk.
+
+fn restic_env(p: &Value) -> Result<Vec<(String, String)>> {
+    let r = &p["restic"];
+    let repo = r["repository"].as_str().ok_or(anyhow!(
+        "restic credentials missing (gateway did not inject them)"
+    ))?;
+    let pw = r["password"]
+        .as_str()
+        .ok_or(anyhow!("restic password missing"))?;
+    Ok(vec![
+        ("RESTIC_REPOSITORY".into(), repo.into()),
+        ("RESTIC_PASSWORD".into(), pw.into()),
+    ])
+}
+
+async fn restic(env: &[(String, String)], args: &[&str]) -> Result<String> {
+    let out = Command::new("restic")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .args(args)
+        .output()
+        .await
+        .context("spawn restic (is it installed?)")?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "restic {:?} failed: {}",
+            args.first(),
+            &e[e.len().saturating_sub(1500)..]
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Host paths of the compose project's named volumes.
+async fn project_volumes(project: &str) -> Result<Vec<String>> {
+    let names = run_tool(
+        "docker",
+        &[
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+        ],
+        None,
+    )
+    .await?;
+    let mut paths = vec![];
+    for n in names.lines().filter(|l| !l.is_empty()) {
+        paths.push(
+            run_tool(
+                "docker",
+                &["volume", "inspect", "-f", "{{.Mountpoint}}", n],
+                None,
+            )
+            .await?
+            .trim()
+            .to_string(),
+        );
+    }
+    Ok(paths)
+}
+
+async fn backup_run(p: &Value, dir: &Path, project: &str) -> Result<Value> {
+    let env = restic_env(p)?;
+    if restic(&env, &["cat", "config"]).await.is_err() {
+        restic(&env, &["init"]).await?;
+    }
+    let mut paths = project_volumes(project).await?;
+    paths.push(path_str(dir)?.to_string());
+    let quiesce = p["quiesce"].as_bool().unwrap_or(true);
+    if quiesce {
+        compose(dir, project, &["stop"]).await?;
+    }
+    let mut args = vec!["backup", "--json", "--tag", "spade", "--tag", project];
+    args.extend(paths.iter().map(String::as_str));
+    let res = restic(&env, &args).await;
+    if quiesce {
+        // Always restart the app, even when the backup failed.
+        compose(dir, project, &["start"]).await?;
+    }
+    let out = res?;
+    let summary: Value = out
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["message_type"] == "summary")
+        .ok_or(anyhow!("restic produced no summary"))?;
+    let keep = p["keep_daily"].as_u64().unwrap_or(7).to_string();
+    restic(
+        &env,
+        &["forget", "--tag", project, "--keep-daily", &keep, "--prune"],
+    )
+    .await?;
+    Ok(
+        json!({"snapshot_id": summary["snapshot_id"], "bytes_added": summary["data_added"], "paths": paths, "quiesced": quiesce}),
+    )
+}
+
+async fn backup_restore(p: &Value, dir: &Path, project: &str) -> Result<Value> {
+    let env = restic_env(p)?;
+    let snap = p["snapshot"].as_str().unwrap_or_default();
+    if snap.len() < 8 || snap.len() > 64 || !snap.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid snapshot id");
+    }
+    compose(dir, project, &["stop"]).await?;
+    // Empty the volumes first so files created after the snapshot do not survive the restore.
+    for v in project_volumes(project).await? {
+        for e in std::fs::read_dir(&v)?.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    let res = restic(&env, &["restore", snap, "--target", "/"]).await;
+    compose(dir, project, &["up", "-d"]).await?;
+    res?;
+    Ok(json!({"restored": snap}))
 }
 
 // ---- private overlay (WireGuard / Nebula) ----

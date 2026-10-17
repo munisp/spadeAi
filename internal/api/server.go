@@ -32,6 +32,8 @@ import (
 type Workflows interface {
 	StartDeploy(ctx context.Context, operationID, serviceID string) (string, error)
 	StartAction(ctx context.Context, operationID, serviceID, action string) (string, error)
+	StartBackup(ctx context.Context, operationID, serviceID string) (string, error)
+	StartRestore(ctx context.Context, operationID, serviceID, backupID string) (string, error)
 }
 
 type Server struct {
@@ -75,6 +77,9 @@ func (s *Server) Router() http.Handler {
 		r.Post("/v1/projects/{project}/services", s.createService)
 		r.Get("/v1/services/{service}", s.getService)
 		r.Post("/v1/services/{service}/actions/{action}", s.serviceAction)
+		r.Get("/v1/services/{service}/backups", s.listBackups)
+		r.Post("/v1/services/{service}/backups", s.createBackup)
+		r.Post("/v1/services/{service}/backups/{backup}/restore", s.restoreBackup)
 		r.Delete("/v1/services/{service}", func(w http.ResponseWriter, r *http.Request) {
 			rctx := chi.RouteContext(r.Context())
 			rctx.URLParams.Add("action", "delete")
@@ -569,6 +574,68 @@ func (s *Server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.WF.StartAction(r.Context(), opID, id, action); err != nil {
+		s.failOperation(r.Context(), opID, "workflow start failed: "+err.Error())
+		writeErr(w, 503, "workflows_unavailable", err.Error())
+		return
+	}
+	s.writeOperation(w, r, opID, 202)
+}
+
+func (s *Server) listBackups(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "service")
+	if !s.allow(w, r, "service", id, "view") {
+		return
+	}
+	s.queryJSON(w, r, `SELECT id, kind, status, restic_snapshot_id, restored_from, bytes_added, error, started_at, finished_at
+		FROM backup_snapshot WHERE service_id=$1 ORDER BY started_at DESC LIMIT 100`, id)
+}
+
+func (s *Server) createBackup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "service")
+	s.backupOp(w, r, id, "operate", "service.backup", []byte(id), func(opID string) error {
+		_, err := s.WF.StartBackup(r.Context(), opID, id)
+		return err
+	})
+}
+
+// restoreBackup overwrites the service's current data, so it needs the destroy permission.
+func (s *Server) restoreBackup(w http.ResponseWriter, r *http.Request) {
+	id, b := chi.URLParam(r, "service"), chi.URLParam(r, "backup")
+	s.backupOp(w, r, id, "destroy", "service.restore", []byte(id+"|"+b), func(opID string) error {
+		_, err := s.WF.StartRestore(r.Context(), opID, id, b)
+		return err
+	})
+}
+
+func (s *Server) backupOp(w http.ResponseWriter, r *http.Request, id, perm, verb string, body []byte, start func(string) error) {
+	key := r.Header.Get("Idempotency-Key")
+	if !require(w, key != "", "Idempotency-Key header is required") || !s.allow(w, r, "service", id, perm) {
+		return
+	}
+	var opID string
+	var existing bool
+	err := s.tx(r.Context(), func(tx pgx.Tx) error {
+		var err error
+		if opID, existing, err = s.startOperation(r.Context(), tx, key, verb, "service", body); err != nil || existing {
+			return err
+		}
+		if _, err := tx.Exec(r.Context(), `UPDATE operation SET target_id=$2 WHERE id=$1`, opID, id); err != nil {
+			return err
+		}
+		return audit.Append(r.Context(), tx, audit.Event{Actor: userFrom(r.Context()).ID, Verb: verb, TargetKind: "service", TargetID: id, Detail: map[string]any{"operation_id": opID}})
+	})
+	switch {
+	case errors.Is(err, errIdempotencyConflict):
+		writeErr(w, 409, "idempotency_conflict", err.Error())
+		return
+	case err != nil:
+		writeErr(w, 422, "invalid_request", err.Error())
+		return
+	case existing:
+		s.writeOperation(w, r, opID, 200)
+		return
+	}
+	if err := start(opID); err != nil {
 		s.failOperation(r.Context(), opID, "workflow start failed: "+err.Error())
 		writeErr(w, 503, "workflows_unavailable", err.Error())
 		return

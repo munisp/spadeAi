@@ -11,17 +11,23 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/munisp/spadeai/internal/secrets"
 )
 
 type Server struct {
 	Pool    *pgxpool.Pool
 	CA      *CA
 	DistDir string // directory containing spade-agent-linux-<arch> binaries
+	// KEK and BackupRepo let the gateway inject backup credentials at delivery; nil/empty fails closed.
+	KEK        *secrets.KEK
+	BackupRepo string
 }
 
 type agentKey struct{}
@@ -132,7 +138,14 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 			SELECT id FROM agent_command WHERE agent_id::text=$1 AND status='queued' AND expires_at > now() ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 			RETURNING id::text, verb, payload`, id).Scan(&cmdID, &verb, &payload)
 		if err == nil {
-			jsonOut(w, 200, map[string]any{"id": cmdID, "verb": verb, "payload": json.RawMessage(payload)})
+			out, ierr := s.injectSecrets(r.Context(), payload)
+			if ierr != nil {
+				// Fail the command rather than deliver it without credentials.
+				res, _ := json.Marshal(map[string]string{"error": ierr.Error()})
+				_, _ = s.Pool.Exec(r.Context(), `UPDATE agent_command SET status='failed', result=$2, updated_at=now() WHERE id=$1`, cmdID, res)
+				continue
+			}
+			jsonOut(w, 200, map[string]any{"id": cmdID, "verb": verb, "payload": json.RawMessage(out)})
 			return
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -220,3 +233,34 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload && systemctl enable --now spade-agent
 `
+
+// injectSecrets resolves payload.secret_ref at delivery time so credentials travel only over the agent's
+// mTLS connection and are never persisted in agent_command.
+func (s *Server) injectSecrets(ctx context.Context, payload []byte) ([]byte, error) {
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, err
+	}
+	ref, ok := p["secret_ref"].(map[string]any)
+	if !ok {
+		return payload, nil
+	}
+	svc, _ := ref["service_id"].(string)
+	if ref["kind"] != "backup" || svc == "" {
+		return nil, fmt.Errorf("unsupported secret_ref")
+	}
+	if s.KEK == nil || s.BackupRepo == "" {
+		return nil, fmt.Errorf("backups unavailable: KEK or SPADE_BACKUP_REPO not configured on the gateway")
+	}
+	var sealed []byte
+	if err := s.Pool.QueryRow(ctx, `SELECT password_sealed FROM service_backup_config WHERE service_id=$1`, svc).Scan(&sealed); err != nil {
+		return nil, fmt.Errorf("backup config for %s: %w", svc, err)
+	}
+	pw, err := s.KEK.Open(sealed, "backup:"+svc)
+	if err != nil {
+		return nil, fmt.Errorf("unseal backup password: %w", err)
+	}
+	delete(p, "secret_ref")
+	p["restic"] = map[string]string{"repository": strings.TrimRight(s.BackupRepo, "/") + "/" + svc, "password": string(pw)}
+	return json.Marshal(p)
+}

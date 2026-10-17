@@ -68,6 +68,16 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
 
+  backups:
+    # restic REST server: off-host backup target. Repositories are encrypted client-side with a
+    # per-service password, so this server never sees plaintext. Local dev only: no auth.
+    image: restic/rest-server:0.13.0
+    environment:
+      DISABLE_AUTHENTICATION: "1"
+    ports: ["8000:8000"]
+    volumes: ["backupdata:/data"]
+
 volumes:
   pgdata: {}
   tbdata: {}
+  backupdata: {}
