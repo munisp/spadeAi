@@ -382,7 +382,16 @@ async fn backup_run(p: &Value, dir: &Path, project: &str) -> Result<Value> {
     }
     let mut paths = project_volumes(project).await?;
     paths.push(path_str(dir)?.to_string());
-    let quiesce = p["quiesce"].as_bool().unwrap_or(true);
+    // Only stop/start containers that are actually running, so backing up a stopped service never starts it.
+    let running = !run_tool(
+        "docker",
+        &["compose", "-p", project, "ps", "-q", "--status", "running"],
+        None,
+    )
+    .await?
+    .trim()
+    .is_empty();
+    let quiesce = p["quiesce"].as_bool().unwrap_or(true) && running;
     if quiesce {
         compose(dir, project, &["stop"]).await?;
     }
@@ -406,8 +415,15 @@ async fn backup_run(p: &Value, dir: &Path, project: &str) -> Result<Value> {
         &["forget", "--tag", project, "--keep-daily", &keep, "--prune"],
     )
     .await?;
+    // Snapshots still in the repository after pruning; the control plane retires the others.
+    let kept: Vec<Value> = serde_json::from_str::<Vec<Value>>(
+        &restic(&env, &["snapshots", "--json", "--tag", project]).await?,
+    )?
+    .into_iter()
+    .map(|s| s["id"].clone())
+    .collect();
     Ok(
-        json!({"snapshot_id": summary["snapshot_id"], "bytes_added": summary["data_added"], "paths": paths, "quiesced": quiesce}),
+        json!({"snapshot_id": summary["snapshot_id"], "bytes_added": summary["data_added"], "paths": paths, "quiesced": quiesce, "kept": kept}),
     )
 }
 
@@ -415,24 +431,72 @@ async fn backup_restore(p: &Value, dir: &Path, project: &str) -> Result<Value> {
     let env = restic_env(p)?;
     let snap = p["snapshot"].as_str().unwrap_or_default();
     if snap.len() < 8 || snap.len() > 64 || !snap.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("invalid snapshot id");
+        bail!("data unchanged: invalid snapshot id");
     }
-    compose(dir, project, &["stop"]).await?;
-    // Empty the volumes first so files created after the snapshot do not survive the restore.
-    for v in project_volumes(project).await? {
-        for e in std::fs::read_dir(&v)?.flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path)?;
-            } else {
-                std::fs::remove_file(&path)?;
+    // Every step before the swap leaves live data untouched; errors say so, so the control plane
+    // can keep the service's state instead of marking it failed.
+    let unchanged = |e: anyhow::Error| anyhow!("data unchanged: {e:#}");
+    let listed: Vec<Value> = serde_json::from_str(
+        &restic(&env, &["snapshots", "--json", "--tag", project, snap])
+            .await
+            .map_err(unchanged)?,
+    )
+    .map_err(|e| unchanged(e.into()))?;
+    let Some(meta) = listed.first() else {
+        bail!("data unchanged: snapshot {snap} is not in this service's repository (pruned?)");
+    };
+    let stack = path_str(dir)?.to_string();
+    let mut allowed = project_volumes(project).await.map_err(unchanged)?;
+    allowed.push(stack.clone());
+    let paths: Vec<String> = meta["paths"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if paths.is_empty() || paths.iter().any(|x| !allowed.contains(x)) {
+        bail!("data unchanged: snapshot paths {paths:?} are outside this service's volumes and stack dir");
+    }
+    // Restore into a staging dir limited to those paths, never directly onto the host root.
+    let stage = format!("{stack}.restore");
+    let _ = std::fs::remove_dir_all(&stage);
+    let mut args = vec!["restore", snap, "--target", stage.as_str()];
+    for x in &paths {
+        args.extend(["--include", x.as_str()]);
+    }
+    if let Err(e) = restic(&env, &args).await {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(unchanged(e));
+    }
+    compose(dir, project, &["stop"]).await.map_err(unchanged)?;
+    let swap = async {
+        for x in &paths {
+            let staged = format!("{stage}{x}");
+            if *x != stack {
+                // Empty volumes first so files created after the snapshot do not survive.
+                for e in std::fs::read_dir(x)?.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        std::fs::remove_dir_all(&path)?;
+                    } else {
+                        std::fs::remove_file(&path)?;
+                    }
+                }
+            }
+            if Path::new(&staged).exists() {
+                run_tool("cp", &["-a", &format!("{staged}/."), x], None).await?;
             }
         }
+        anyhow::Ok(())
     }
-    let res = restic(&env, &["restore", snap, "--target", "/"]).await;
-    compose(dir, project, &["up", "-d"]).await?;
-    res?;
-    Ok(json!({"restored": snap}))
+    .await;
+    let up = compose(dir, project, &["up", "-d"]).await;
+    let _ = std::fs::remove_dir_all(&stage);
+    swap?;
+    up?;
+    Ok(json!({"restored": snap, "paths": paths}))
 }
 
 // ---- private overlay (WireGuard / Nebula) ----

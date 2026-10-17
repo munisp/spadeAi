@@ -191,6 +191,9 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 			return "unavailable", "backup repository unreachable: " + err.Error()
 		}
 		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "unavailable", "backup repository rejected the credentials in SPADE_BACKUP_REPO"
+		}
 		return "available", "restic REST repository; hosts need restic"
 	})
 }

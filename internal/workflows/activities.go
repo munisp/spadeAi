@@ -440,6 +440,15 @@ func (a *Activities) BackupFinish(ctx context.Context, recordID, cmdID, errMsg s
 	}
 	_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot b SET status='succeeded', finished_at=now(), restic_snapshot_id=c.result->>'snapshot_id',
 		bytes_added=(c.result->>'bytes_added')::bigint FROM agent_command c WHERE b.id=$1 AND c.id=$2`, recordID, cmdID)
+	if err != nil {
+		return err
+	}
+	// Retire backups whose snapshot retention pruned, so they are never offered for restore.
+	_, err = a.Pool.Exec(ctx, `UPDATE backup_snapshot o SET status='pruned'
+		FROM backup_snapshot b JOIN agent_command c ON c.id=$2
+		WHERE b.id=$1 AND b.kind='backup' AND o.service_id=b.service_id AND o.kind='backup' AND o.status='succeeded'
+		  AND o.restic_snapshot_id IS NOT NULL AND jsonb_typeof(c.result->'kept')='array'
+		  AND NOT jsonb_exists(c.result->'kept', o.restic_snapshot_id)`, recordID, cmdID)
 	return err
 }
 

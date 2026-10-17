@@ -66,6 +66,19 @@ docker exec "$V" curl -sf http://127.0.0.1:18081/extra.txt >/dev/null && fail "f
 [ "$(curl -sf "${H[@]}" "$API/v1/services/$SVC" | j "d['state']")" = running ] || fail "service not running after restore"
 echo "PASS restore: data back to the snapshot exactly, service running"
 
+SOP=$(curl -sf "${H[@]}" -X POST -H "Idempotency-Key: $(key)" "$API/v1/services/$SVC/actions/stop" | j "d['id']")
+wait_op "$SOP"
+B2=$(curl -sf "${H[@]}" -X POST -H "Idempotency-Key: $(key)" "$API/v1/services/$SVC/backups" | j "d['id']")
+wait_op "$B2"
+[ -z "$(docker exec "$V" docker compose -p "spade-${SVC:0:8}" ps -q --status running)" ] || fail "backup of a stopped service started its containers"
+echo "PASS backup of a stopped service leaves it stopped"
+
+# The repository password (if SPADE_BACKUP_REPO carries one) must not leak into payloads or results.
+PW=$(sed -nE 's#.*https?://[^:/@]+:([^@]+)@.*#\1#p' <<<"${SPADE_BACKUP_REPO:-}")
+if [ -n "$PW" ]; then
+  [ "$(sql "SELECT count(*) FROM agent_command WHERE payload::text LIKE '%$PW%' OR coalesce(result::text,'') LIKE '%$PW%'")" = 0 ] \
+    || fail "backup repository password leaked into agent_command"
+fi
 [ "$(sql "SELECT count(*) FROM agent_command WHERE verb LIKE 'backup_%' AND (payload ? 'restic' OR payload::text ILIKE '%password%')")" = 0 ] \
   || fail "backup credentials were persisted in the command queue"
 echo "PASS backup credentials never stored in agent_command"
