@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,18 +30,28 @@ func fakeAPI(t *testing.T) *httptest.Server {
 		case r.Method == "GET" && r.URL.Path == "/locations":
 			_, _ = w.Write([]byte(`{"locations":[]}`))
 		case r.Method == "GET" && r.URL.Path == "/servers":
-			out := []any{}
+			match := []map[string]any{}
 			for _, s := range servers {
-				match := true
+				ok := true
 				for _, kv := range strings.Split(r.URL.Query().Get("label_selector"), ",") {
 					k, v, _ := strings.Cut(kv, "=")
-					match = match && s["labels"].(map[string]any)[k] == v
+					ok = ok && s["labels"].(map[string]any)[k] == v
 				}
-				if match {
-					out = append(out, s)
+				if ok {
+					match = append(match, s)
 				}
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"servers": out})
+			sort.Slice(match, func(i, j int) bool { return match[i]["id"].(int64) < match[j]["id"].(int64) })
+			// One server per page so the contract test exercises pagination.
+			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+			out := map[string]any{"servers": []any{}, "meta": map[string]any{"pagination": map[string]any{"next_page": nil}}}
+			if page >= 1 && page <= len(match) {
+				out["servers"] = []any{match[page-1]}
+				if page < len(match) {
+					out["meta"] = map[string]any{"pagination": map[string]any{"next_page": page + 1}}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == "POST" && r.URL.Path == "/servers":
 			var in map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&in)

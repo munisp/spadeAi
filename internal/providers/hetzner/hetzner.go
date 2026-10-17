@@ -4,6 +4,7 @@ package hetzner
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -49,21 +50,38 @@ func (a apiServer) server() cloud.Server {
 
 func Label(serviceID string) string { return "spade-service=" + serviceID }
 
+// List pages through every server carrying the service label; a partial list would let DeleteAll
+// report success while servers past the first page keep running.
 func (c *Client) List(ctx context.Context, serviceID string) ([]cloud.Server, error) {
-	var out struct {
-		Servers []apiServer `json:"servers"`
-	}
-	if _, err := c.api().Do(ctx, http.MethodGet, "/servers?per_page=50&label_selector="+url.QueryEscape(Label(serviceID)), nil, nil, &out); err != nil {
-		return nil, err
-	}
 	var res []cloud.Server
-	for _, s := range out.Servers {
-		if s.Labels["spade-service"] == serviceID {
-			res = append(res, s.server())
+	for page := 1; ; page++ {
+		if page > maxPages {
+			return nil, fmt.Errorf("hetzner: more than %d pages of servers for service %s", maxPages, serviceID)
+		}
+		var out struct {
+			Servers []apiServer `json:"servers"`
+			Meta    struct {
+				Pagination struct {
+					NextPage *int `json:"next_page"`
+				} `json:"pagination"`
+			} `json:"meta"`
+		}
+		path := fmt.Sprintf("/servers?per_page=50&page=%d&label_selector=%s", page, url.QueryEscape(Label(serviceID)))
+		if _, err := c.api().Do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+			return nil, err
+		}
+		for _, s := range out.Servers {
+			if s.Labels["spade-service"] == serviceID {
+				res = append(res, s.server())
+			}
+		}
+		if out.Meta.Pagination.NextPage == nil {
+			return res, nil
 		}
 	}
-	return res, nil
 }
+
+const maxPages = 100
 
 func (c *Client) Create(ctx context.Context, o cloud.CreateOpts) (*cloud.Server, error) {
 	loc := c.Location
