@@ -1,53 +1,137 @@
-# Two-site HA rehearsal: "Lagos" (primary site) and "Abuja" (standby site) on one machine.
-#   Postgres: pg-lagos primary, pg-abuja hot standby by synchronous streaming replication (slot "abuja"):
-#   a commit is acknowledged only once Abuja has it, so promoting Abuja loses no acknowledged write.
-#   Trade-off: while Abuja is down, writes on Lagos block until it returns or the operator relaxes
-#   synchronous_standby_names (scripts/ha-failover.sh does so when it promotes).
-#   TigerBeetle: 3 replicas, one per site: Lagos, Abuja and a witness site (e.g. Port Harcourt). Any two
-#   form a quorum, so losing any one whole site keeps the ledger writable. Two sites alone cannot do
-#   this: losing the site holding the majority would stop all money movement.
+# Two-site HA rehearsal on one machine: "Lagos" (initial primary site), "Abuja" (second site) and a
+# "witness" site that holds only tie-breaker votes (location still to be chosen; configurable).
+#   Consensus: etcd, one member per site. Any two sites form a quorum, so losing one keeps a leader.
+#   Postgres: Patroni on pg-lagos and pg-abuja with synchronous_mode. A commit is acknowledged only once
+#   the synchronous standby has it, and Patroni promotes only that standby, so automatic failover loses
+#   no acknowledged write. A primary cut off from etcd demotes itself (no split brain), and a returning
+#   old primary is rewound and rejoins as a standby.
+#   Floating address: haproxy-lagos / haproxy-abuja forward to whichever node Patroni reports as
+#   leader. Temporal, Keycloak and Permify (run in Abuja here) use it, so they follow failover.
+#   TigerBeetle: 3 replicas, one per site; any two form a quorum.
 #   Backups: a second restic REST server in Abuja receives copies of every repository.
 # Ports differ from deploy/compose so both stacks can run side by side. Local dev only.
 name: spade-ha
 x-pg: &pg
-  image: postgres:16-alpine
+  build: ./patroni
+  image: spade-ha-patroni:local
+  init: true
   environment: &pgenv
-    POSTGRES_USER: spade
-    POSTGRES_PASSWORD: spade-local-dev
-    POSTGRES_DB: spadeai
-    SPADE_REPLICATION_PASSWORD: ${SPADE_REPLICATION_PASSWORD:-replication-local-dev}
+    PATRONI_SUPERUSER_PASSWORD: spade-local-dev
+    PATRONI_REPLICATION_PASSWORD: ${SPADE_REPLICATION_PASSWORD:-replication-local-dev}
   healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U spade -d spadeai"]
+    test: ["CMD", "curl", "-fs", "http://127.0.0.1:8008/health"]
     interval: 2s
-    retries: 30
+    retries: 60
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.17
 x-tb: &tb
   image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
   security_opt: ["seccomp=unconfined"]
+x-haproxy: &haproxy
+  image: haproxy:2.8-alpine
+  volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
 
 services:
+  etcd-lagos: &etcdnode
+    <<: *etcd
+    command: [etcd, --name=etcd-lagos, --data-dir=/data, --listen-client-urls=http://0.0.0.0:2379,
+      --advertise-client-urls=http://172.31.240.40:2379, --listen-peer-urls=http://0.0.0.0:2380,
+      --initial-advertise-peer-urls=http://172.31.240.40:2380, --initial-cluster-state=new,
+      --initial-cluster-token=spade-ha, "--initial-cluster=etcd-lagos=http://172.31.240.40:2380,etcd-abuja=http://172.31.240.41:2380,etcd-witness=http://172.31.240.42:2380"]
+    volumes: ["etcd-lagos:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.40}}
+  etcd-abuja:
+    <<: *etcd
+    command: [etcd, --name=etcd-abuja, --data-dir=/data, --listen-client-urls=http://0.0.0.0:2379,
+      --advertise-client-urls=http://172.31.240.41:2379, --listen-peer-urls=http://0.0.0.0:2380,
+      --initial-advertise-peer-urls=http://172.31.240.41:2380, --initial-cluster-state=new,
+      --initial-cluster-token=spade-ha, "--initial-cluster=etcd-lagos=http://172.31.240.40:2380,etcd-abuja=http://172.31.240.41:2380,etcd-witness=http://172.31.240.42:2380"]
+    volumes: ["etcd-abuja:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.41}}
+  etcd-witness:
+    <<: *etcd
+    command: [etcd, --name=etcd-witness, --data-dir=/data, --listen-client-urls=http://0.0.0.0:2379,
+      --advertise-client-urls=http://172.31.240.42:2379, --listen-peer-urls=http://0.0.0.0:2380,
+      --initial-advertise-peer-urls=http://172.31.240.42:2380, --initial-cluster-state=new,
+      --initial-cluster-token=spade-ha, "--initial-cluster=etcd-lagos=http://172.31.240.40:2380,etcd-abuja=http://172.31.240.41:2380,etcd-witness=http://172.31.240.42:2380"]
+    volumes: ["etcd-witness:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.42}}
+
   pg-lagos:
     <<: *pg
-    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "wal_keep_size=256MB"]
-    ports: ["5441:5432"]
-    volumes: ["pg-lagos:/var/lib/postgresql/data", "./pg-primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro", "../compose/postgres-init/01-databases.sql:/docker-entrypoint-initdb.d/01-databases.sql:ro"]
-    networks: {ha: {ipv4_address: 172.31.240.10}}
-
-  pg-abuja:
-    <<: *pg
-    entrypoint: ["/bin/sh", "/standby.sh"]
     environment:
       <<: *pgenv
-      PRIMARY_HOST: pg-lagos
+      PATRONI_NAME: lagos
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 172.31.240.10:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 172.31.240.10:5432
+    ports: ["5441:5432"]
+    volumes: ["pg-lagos:/var/lib/postgresql/data", "./patroni/patroni.yml:/etc/patroni.yml:ro", "./patroni/post-bootstrap.sh:/etc/patroni-post-bootstrap.sh:ro"]
+    networks: {ha: {ipv4_address: 172.31.240.10}}
+    depends_on: [etcd-lagos, etcd-abuja, etcd-witness]
+  pg-abuja:
+    <<: *pg
+    environment:
+      <<: *pgenv
+      PATRONI_NAME: abuja
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 172.31.240.11:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 172.31.240.11:5432
     ports: ["5442:5432"]
-    volumes: ["pg-abuja:/var/lib/postgresql/data", "./pg-standby.sh:/standby.sh:ro"]
+    volumes: ["pg-abuja:/var/lib/postgresql/data", "./patroni/patroni.yml:/etc/patroni.yml:ro", "./patroni/post-bootstrap.sh:/etc/patroni-post-bootstrap.sh:ro"]
     networks: {ha: {ipv4_address: 172.31.240.11}}
+    # Lagos bootstraps the cluster; Abuja then clones it.
     depends_on: {pg-lagos: {condition: service_healthy}}
+
+  haproxy-lagos:
+    <<: *haproxy
+    ports: ["5451:5432"]
+    networks: {ha: {ipv4_address: 172.31.240.50}}
+  haproxy-abuja:
+    <<: *haproxy
+    ports: ["5452:5432"]
+    networks: {ha: {ipv4_address: 172.31.240.51}}
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: spade
+      POSTGRES_PWD: spade-local-dev
+      POSTGRES_SEEDS: 172.31.240.51
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+    ports: ["7243:7233"]
+    networks: {ha: {ipv4_address: 172.31.240.60}}
+    depends_on: {pg-lagos: {condition: service_healthy}, haproxy-abuja: {condition: service_started}}
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://172.31.240.51:5432/keycloak
+      KC_DB_USERNAME: spade
+      KC_DB_PASSWORD: spade-local-dev
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin-local-dev
+      KC_HTTP_PORT: "8080"
+    ports: ["8190:8080"]
+    volumes: ["../compose/keycloak:/opt/keycloak/data/import:ro"]
+    networks: {ha: {ipv4_address: 172.31.240.61}}
+    depends_on: {pg-lagos: {condition: service_healthy}, haproxy-abuja: {condition: service_started}}
+  permify:
+    image: ghcr.io/permify/permify:latest
+    restart: unless-stopped
+    command: ["serve", "--database-engine=postgres", "--database-uri=postgres://spade:spade-local-dev@172.31.240.51:5432/permify?sslmode=disable", "--database-auto-migrate=true"]
+    ports: ["3486:3476"]
+    networks: {ha: {ipv4_address: 172.31.240.62}}
+    depends_on: {pg-lagos: {condition: service_healthy}, haproxy-abuja: {condition: service_started}}
 
   tb-format:
     <<: *tb
     entrypoint: ["/bin/sh", "-c", "for r in 0 1 2; do test -f /data$$r/0_$$r.tigerbeetle || /tigerbeetle format --cluster=0 --replica=$$r --replica-count=3 --development /data$$r/0_$$r.tigerbeetle; done"]
     volumes: ["tb0:/data0", "tb1:/data1", "tb2:/data2"]
-
   tb-lagos: &tbnode
     <<: *tb
     command: ["start", "--addresses=172.31.240.20:3000,172.31.240.21:3000,172.31.240.22:3000", "--development", "/data/0_0.tigerbeetle"]
@@ -82,4 +166,4 @@ networks:
   ha:
     ipam: {config: [{subnet: 172.31.240.0/24}]}
 
-volumes: {pg-lagos: {}, pg-abuja: {}, tb0: {}, tb1: {}, tb2: {}, backups-abuja: {}}
+volumes: {etcd-lagos: {}, etcd-abuja: {}, etcd-witness: {}, pg-lagos: {}, pg-abuja: {}, tb0: {}, tb1: {}, tb2: {}, backups-abuja: {}}
