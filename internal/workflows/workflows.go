@@ -1,0 +1,165 @@
+// Package workflows holds the Temporal workflows for deploy, day-2 actions and billing suspension.
+package workflows
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+)
+
+const TaskQueue = "spade-core"
+
+// Starter implements api.Workflows on a Temporal client.
+type Starter struct{ C client.Client }
+
+func (s Starter) StartDeploy(ctx context.Context, opID, serviceID string) (string, error) {
+	run, err := s.C.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: "deploy-" + serviceID, TaskQueue: TaskQueue}, DeployService, opID, serviceID)
+	if err != nil {
+		return "", err
+	}
+	return run.GetID(), nil
+}
+
+func (s Starter) StartAction(ctx context.Context, opID, serviceID, action string) (string, error) {
+	run, err := s.C.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: "action-" + opID, TaskQueue: TaskQueue}, ServiceAction, opID, serviceID, action)
+	if err != nil {
+		return "", err
+	}
+	return run.GetID(), nil
+}
+
+func short(ctx workflow.Context) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: 30 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5, NonRetryableErrorTypes: []string{"NonRetryable"}}})
+}
+
+func waiting(ctx workflow.Context, d time.Duration) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: d, HeartbeatTimeout: 30 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 1}})
+}
+
+// DeployService: hold (funds check) -> provision -> agent enrolment -> apply bundle -> health -> void hold -> running.
+func DeployService(ctx workflow.Context, opID, serviceID string) error {
+	var a *Activities
+	info := workflow.GetInfo(ctx)
+	sctx := short(ctx)
+	if err := workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "running", info.WorkflowExecution.ID, "", nil).Get(ctx, nil); err != nil {
+		return err
+	}
+	fail := func(stage string, cause error) error {
+		dctx, _ := workflow.NewDisconnectedContext(ctx)
+		dctx = short(dctx)
+		_ = workflow.ExecuteActivity(dctx, a.VoidHold, serviceID).Get(dctx, nil)
+		reason := fmt.Sprintf("%s: %v", stage, cause)
+		_ = workflow.ExecuteActivity(dctx, a.SetState, serviceID, "failed", reason).Get(dctx, nil)
+		_ = workflow.ExecuteActivity(dctx, a.MarkOperation, opID, "failed", "", reason, nil).Get(dctx, nil)
+		return cause
+	}
+	if err := workflow.ExecuteActivity(sctx, a.PlaceHold, serviceID).Get(ctx, nil); err != nil {
+		return fail("funds_check", err)
+	}
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "provisioning_vm", "").Get(ctx, nil); err != nil {
+		return fail("state", err)
+	}
+	var prov ProvisionResult
+	if err := workflow.ExecuteActivity(sctx, a.Provision, serviceID).Get(ctx, &prov); err != nil {
+		return fail("provision", err)
+	}
+	_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "running", info.WorkflowExecution.ID, "", map[string]any{"bootstrap": prov.Bootstrap, "enrol_expires_at": prov.EnrolExpiresAt}).Get(ctx, nil)
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "bootstrapping_agent", "waiting for agent enrolment").Get(ctx, nil); err != nil {
+		return fail("state", err)
+	}
+	if err := workflow.ExecuteActivity(waiting(ctx, AgentWait), a.WaitForAgent, serviceID).Get(ctx, nil); err != nil {
+		return fail("agent_enrolment", err)
+	}
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "installing_app", "").Get(ctx, nil); err != nil {
+		return fail("state", err)
+	}
+	if err := runCommand(ctx, a, serviceID, "apply_bundle"); err != nil {
+		return fail("install", err)
+	}
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "configuring_tls", "").Get(ctx, nil); err != nil {
+		return fail("state", err)
+	}
+	if err := runCommand(ctx, a, serviceID, "health_probe"); err != nil {
+		return fail("health_probe", err)
+	}
+	if err := workflow.ExecuteActivity(sctx, a.VoidHold, serviceID).Get(ctx, nil); err != nil {
+		return fail("void_hold", err)
+	}
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "running", "").Get(ctx, nil); err != nil {
+		return fail("state", err)
+	}
+	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", map[string]any{"service_id": serviceID, "bootstrap": prov.Bootstrap}).Get(ctx, nil)
+}
+
+// AgentWait slightly exceeds the 15-minute single-use enrolment token lifetime.
+var AgentWait = 16 * time.Minute
+
+func runCommand(ctx workflow.Context, a *Activities, serviceID, verb string) error {
+	var cmdID string
+	if err := workflow.ExecuteActivity(short(ctx), a.QueueCommand, serviceID, verb).Get(ctx, &cmdID); err != nil {
+		return err
+	}
+	return workflow.ExecuteActivity(waiting(ctx, 15*time.Minute), a.WaitCommand, cmdID).Get(ctx, nil)
+}
+
+// ServiceAction runs a day-2 action (start/stop/restart/delete) through the agent.
+func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
+	var a *Activities
+	sctx := short(ctx)
+	_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "running", workflow.GetInfo(ctx).WorkflowExecution.ID, "", nil).Get(ctx, nil)
+	verb, final := map[string][2]string{
+		"start": {"compose_up", "running"}, "stop": {"compose_down", "stopped"},
+		"restart": {"compose_restart", "running"}, "delete": {"compose_down", "deleted"},
+	}[action][0], map[string]string{"start": "running", "stop": "stopped", "restart": "running", "delete": "deleted"}[action]
+	if action == "delete" {
+		_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, "deleting", "").Get(ctx, nil)
+	}
+	if err := runCommand(ctx, a, serviceID, verb); err != nil {
+		_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
+		return err
+	}
+	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, final, "").Get(ctx, nil); err != nil {
+		return err
+	}
+	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", map[string]any{"state": final}).Get(ctx, nil)
+}
+
+// SuspendOrg stops every running service of an org whose prepaid debit was rejected.
+func SuspendOrg(ctx workflow.Context, orgID string) error {
+	var a *Activities
+	sctx := short(ctx)
+	var services []string
+	if err := workflow.ExecuteActivity(sctx, a.SuspendOrgStart, orgID).Get(ctx, &services); err != nil {
+		return err
+	}
+	for _, s := range services {
+		if err := runCommand(ctx, a, s, "compose_down"); err != nil {
+			workflow.GetLogger(ctx).Warn("stop during suspension failed; service stays suspended (not billed)", "service", s, "err", err)
+		}
+	}
+	return nil
+}
+
+// ResumeOrg restarts services suspended for non-payment once arrears are cleared.
+func ResumeOrg(ctx workflow.Context, orgID string) error {
+	var a *Activities
+	sctx := short(ctx)
+	var services []string
+	if err := workflow.ExecuteActivity(sctx, a.ResumeOrgStart, orgID).Get(ctx, &services); err != nil {
+		return err
+	}
+	for _, s := range services {
+		if err := runCommand(ctx, a, s, "compose_up"); err != nil {
+			_ = workflow.ExecuteActivity(sctx, a.SetState, s, "failed", "resume failed: "+err.Error()).Get(ctx, nil)
+			continue
+		}
+		_ = workflow.ExecuteActivity(sctx, a.SetState, s, "running", "").Get(ctx, nil)
+	}
+	return nil
+}

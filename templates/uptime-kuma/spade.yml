@@ -1,0 +1,12 @@
+slug: uptime-kuma
+name: Uptime Kuma
+category: monitoring
+licence_spdx: MIT
+description: Self-hosted uptime monitoring.
+version: "1.23.16"
+min_vcpu: 1
+min_ram_mb: 1024
+health:
+  port: 3001
+  path: /
+  expect_status: [200, 302]

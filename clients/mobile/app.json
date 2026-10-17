@@ -1,0 +1,3 @@
+{ "expo": { "name": "SpadeAi", "slug": "spadeai", "scheme": "spadeai", "version": "0.1.0", "orientation": "portrait",
+  "ios": { "bundleIdentifier": "ng.spadeai.app" }, "android": { "package": "ng.spadeai.app" },
+  "extra": { "api": "http://10.0.2.2:8080", "issuer": "http://10.0.2.2:8180/realms/spadeai" } } }
