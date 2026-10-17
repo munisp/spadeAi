@@ -4,11 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -76,6 +76,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	verifier := auth.NewVerifier(config.OIDCIssuer(), "spade-api")
 	led := &ledger.Ledger{TB: tbc, Pool: pool}
 	caps := capability.New(pool)
+	caps.Register("ha", func(ctx context.Context) (string, string) {
+		return haStatus(ctx, pool, len(config.TBAddresses()))
+	})
 	registerProbes(caps, pool.Ping, led, tc, verifier, az)
 	go caps.Loop(ctx, 15*time.Second)
 	secret := os.Getenv("SPADE_INTERNAL_SECRET")
@@ -222,23 +225,47 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 		if admin == "" {
 			return "degraded", "SPADE_BACKUP_ADMIN_REPO not configured: backups run but retention (pruning) cannot"
 		}
-		au, err := url.Parse(strings.TrimPrefix(admin, "rest:"))
-		if err != nil || au.User == nil {
-			return "degraded", "SPADE_BACKUP_ADMIN_REPO must be rest:http(s)://user:password@host[:port]"
-		}
-		apw, _ := au.User.Password()
-		auser := au.User.Username()
-		au.User = nil
-		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, au.String(), nil)
-		req.SetBasicAuth(auser, apw)
-		resp, err = hc.Do(req)
-		if err != nil {
-			return "degraded", "backup admin endpoint unreachable: retention cannot run: " + err.Error()
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return "degraded", "backup admin endpoint rejected SPADE_BACKUP_ADMIN_REPO credentials: retention cannot run"
+		if err := backups.ProbeAdmin(ctx, hc, admin, "SPADE_BACKUP_ADMIN_REPO"); err != nil {
+			return "degraded", "retention cannot run: " + err.Error()
 		}
 		return "available", "restic REST repository: per-service append-only logins; retention via admin endpoint"
 	})
+	c.Register("backups.offsite", func(ctx context.Context) (string, string) {
+		replica := os.Getenv("SPADE_BACKUP_REPLICA_REPO")
+		if replica == "" {
+			return "unavailable", "SPADE_BACKUP_REPLICA_REPO not configured: backups exist at one site only"
+		}
+		if err := backups.ProbeAdmin(ctx, &http.Client{Timeout: 3 * time.Second}, replica, "SPADE_BACKUP_REPLICA_REPO"); err != nil {
+			return "degraded", err.Error()
+		}
+		return "available", "every backup is copied to the off-site restic server after retention"
+	})
+}
+
+// haStatus reports whether the control plane would survive losing one site: Postgres must have a
+// synchronous standby streaming (so promotion loses no acknowledged write) and TigerBeetle must run at
+// least three replicas (so one site's loss keeps a quorum). See deploy/ha and scripts/e2e-ha.sh.
+func haStatus(ctx context.Context, pool *pgxpool.Pool, tbReplicas int) (string, string) {
+	var sync int
+	var lagBytes *int64
+	err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE sync_state IN ('sync','quorum') AND state='streaming'),
+		max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn))::bigint FROM pg_stat_replication`).Scan(&sync, &lagBytes)
+	if err != nil {
+		return "unavailable", "cannot read replication status: " + err.Error()
+	}
+	var problems []string
+	if sync == 0 {
+		problems = append(problems, "postgres has no synchronous standby streaming")
+	}
+	if tbReplicas < 3 {
+		problems = append(problems, fmt.Sprintf("tigerbeetle has %d replica address(es), needs 3 across sites", tbReplicas))
+	}
+	if len(problems) > 0 {
+		return "unavailable", "single-site: " + strings.Join(problems, "; ")
+	}
+	lag := int64(0)
+	if lagBytes != nil {
+		lag = *lagBytes
+	}
+	return "available", fmt.Sprintf("%d synchronous postgres standby(s), replay lag %d bytes; tigerbeetle %d replicas", sync, lag, tbReplicas)
 }

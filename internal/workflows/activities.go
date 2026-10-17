@@ -42,6 +42,7 @@ type Activities struct {
 	Htpasswd   *backups.Htpasswd
 	BackupRepo string
 	Pruner     *backups.Pruner
+	Replicator *backups.Replicator
 }
 
 func nonRetryable(format string, args ...any) error {
@@ -536,6 +537,27 @@ func (a *Activities) PruneBackups(ctx context.Context, serviceID string) error {
 	}
 	_, err = a.Pool.Exec(ctx, `UPDATE backup_snapshot SET status='pruned' WHERE service_id=$1 AND kind='backup' AND status='succeeded'
 		AND restic_snapshot_id IS NOT NULL AND NOT (restic_snapshot_id = ANY($2::text[]))`, serviceID, kept)
+	return err
+}
+
+// ReplicateBackups copies the service's repository to the off-site restic server after retention ran.
+func (a *Activities) ReplicateBackups(ctx context.Context, serviceID string) error {
+	if a.KEK == nil || !a.Replicator.Configured() {
+		return nonRetryable("backup replication unavailable: SPADE_BACKUP_REPLICA_REPO not configured on the worker")
+	}
+	var user *string
+	var sealed []byte
+	if err := a.Pool.QueryRow(ctx, `SELECT repo_user, password_sealed FROM service_backup_config WHERE service_id=$1`, serviceID).Scan(&user, &sealed); err != nil {
+		return err
+	}
+	if user == nil {
+		return nonRetryable("service %s has no backup login", serviceID)
+	}
+	pw, err := a.KEK.Open(sealed, "backup:"+serviceID)
+	if err != nil {
+		return nonRetryable("unseal backup password: %v", err)
+	}
+	_, err = a.Replicator.Copy(ctx, *user, string(pw), "spade-"+serviceID[:8])
 	return err
 }
 

@@ -1,0 +1,85 @@
+# Two-site HA rehearsal: "Lagos" (primary site) and "Abuja" (standby site) on one machine.
+#   Postgres: pg-lagos primary, pg-abuja hot standby by synchronous streaming replication (slot "abuja"):
+#   a commit is acknowledged only once Abuja has it, so promoting Abuja loses no acknowledged write.
+#   Trade-off: while Abuja is down, writes on Lagos block until it returns or the operator relaxes
+#   synchronous_standby_names (scripts/ha-failover.sh does so when it promotes).
+#   TigerBeetle: 3 replicas, one per site: Lagos, Abuja and a witness site (e.g. Port Harcourt). Any two
+#   form a quorum, so losing any one whole site keeps the ledger writable. Two sites alone cannot do
+#   this: losing the site holding the majority would stop all money movement.
+#   Backups: a second restic REST server in Abuja receives copies of every repository.
+# Ports differ from deploy/compose so both stacks can run side by side. Local dev only.
+name: spade-ha
+x-pg: &pg
+  image: postgres:16-alpine
+  environment: &pgenv
+    POSTGRES_USER: spade
+    POSTGRES_PASSWORD: spade-local-dev
+    POSTGRES_DB: spadeai
+    SPADE_REPLICATION_PASSWORD: ${SPADE_REPLICATION_PASSWORD:-replication-local-dev}
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U spade -d spadeai"]
+    interval: 2s
+    retries: 30
+x-tb: &tb
+  image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+  security_opt: ["seccomp=unconfined"]
+
+services:
+  pg-lagos:
+    <<: *pg
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "wal_keep_size=256MB"]
+    ports: ["5441:5432"]
+    volumes: ["pg-lagos:/var/lib/postgresql/data", "./pg-primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro", "../compose/postgres-init/01-databases.sql:/docker-entrypoint-initdb.d/01-databases.sql:ro"]
+    networks: {ha: {ipv4_address: 172.31.240.10}}
+
+  pg-abuja:
+    <<: *pg
+    entrypoint: ["/bin/sh", "/standby.sh"]
+    environment:
+      <<: *pgenv
+      PRIMARY_HOST: pg-lagos
+    ports: ["5442:5432"]
+    volumes: ["pg-abuja:/var/lib/postgresql/data", "./pg-standby.sh:/standby.sh:ro"]
+    networks: {ha: {ipv4_address: 172.31.240.11}}
+    depends_on: {pg-lagos: {condition: service_healthy}}
+
+  tb-format:
+    <<: *tb
+    entrypoint: ["/bin/sh", "-c", "for r in 0 1 2; do test -f /data$$r/0_$$r.tigerbeetle || /tigerbeetle format --cluster=0 --replica=$$r --replica-count=3 --development /data$$r/0_$$r.tigerbeetle; done"]
+    volumes: ["tb0:/data0", "tb1:/data1", "tb2:/data2"]
+
+  tb-lagos: &tbnode
+    <<: *tb
+    command: ["start", "--addresses=172.31.240.20:3000,172.31.240.21:3000,172.31.240.22:3000", "--development", "/data/0_0.tigerbeetle"]
+    ports: ["3011:3000"]
+    volumes: ["tb0:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.20}}
+    depends_on: {tb-format: {condition: service_completed_successfully}}
+  tb-abuja:
+    <<: *tbnode
+    command: ["start", "--addresses=172.31.240.20:3000,172.31.240.21:3000,172.31.240.22:3000", "--development", "/data/0_1.tigerbeetle"]
+    ports: ["3012:3000"]
+    volumes: ["tb1:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.21}}
+  tb-witness:
+    <<: *tbnode
+    command: ["start", "--addresses=172.31.240.20:3000,172.31.240.21:3000,172.31.240.22:3000", "--development", "/data/0_2.tigerbeetle"]
+    ports: ["3013:3000"]
+    volumes: ["tb2:/data"]
+    networks: {ha: {ipv4_address: 172.31.240.22}}
+
+  backups-abuja:
+    # Off-site copy target for restic repositories; only the worker writes here (admin login).
+    image: restic/rest-server:0.13.0
+    environment:
+      PASSWORD_FILE: /admin/htpasswd
+      OPTIONS: --append-only
+    ports: ["127.0.0.1:8002:8000"]
+    volumes: ["backups-abuja:/data", "../../.spade/backup-abuja:/admin"]
+    networks: {ha: {ipv4_address: 172.31.240.30}}
+
+networks:
+  ha:
+    ipam: {config: [{subnet: 172.31.240.0/24}]}
+
+volumes: {pg-lagos: {}, pg-abuja: {}, tb0: {}, tb1: {}, tb2: {}, backups-abuja: {}}

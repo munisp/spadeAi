@@ -208,19 +208,54 @@ func (p *Pruner) Prune(ctx context.Context, user, repoPassword, tag string, keep
 	if !userRe.MatchString(user) || keepDaily < 1 {
 		return nil, fmt.Errorf("invalid prune request for %q", user)
 	}
-	raw := strings.TrimPrefix(p.AdminRepo, "rest:")
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil || u.Host == "" {
-		return nil, errors.New("SPADE_BACKUP_ADMIN_REPO must be rest:http(s)://user:password@host[:port]")
+	repo, err := adminRepo(p.AdminRepo, "SPADE_BACKUP_ADMIN_REPO", user)
+	if err != nil {
+		return nil, err
+	}
+	run := resticRunner(ctx, p.Restic, "RESTIC_REPOSITORY="+repo, "RESTIC_PASSWORD="+repoPassword)
+	if _, err := run("forget", "--tag", tag, "--keep-daily", fmt.Sprint(keepDaily), "--prune"); err != nil {
+		return nil, err
+	}
+	out, err := run("snapshots", "--json", "--tag", tag)
+	if err != nil {
+		return nil, err
+	}
+	return snapshotIDs(out)
+}
+
+func snapshotIDs(out []byte) ([]string, error) {
+	var snaps []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out, &snaps); err != nil {
+		return nil, fmt.Errorf("restic snapshots: %w", err)
+	}
+	ids := make([]string, 0, len(snaps))
+	for _, s := range snaps {
+		ids = append(ids, s.ID)
+	}
+	return ids, nil
+}
+
+// adminRepo turns an admin endpoint (rest:http(s)://user:pw@host[:port], from env var name) into the
+// repository URL of one service login. Plain HTTP is refused unless the endpoint is on loopback.
+func adminRepo(raw, name, user string) (string, error) {
+	u, err := url.Parse(strings.TrimPrefix(raw, "rest:"))
+	if err != nil || !strings.HasPrefix(raw, "rest:") || u.User == nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("%s must be rest:http(s)://user:password@host[:port]", name)
 	}
 	if u.Scheme == "http" && !loopback(u.Hostname()) {
-		return nil, errors.New("SPADE_BACKUP_ADMIN_REPO over plain HTTP is only allowed on loopback")
+		return "", fmt.Errorf("%s over plain HTTP is only allowed on loopback", name)
 	}
 	u.Path = path.Join("/", u.Path, user)
-	env := append(os.Environ(), "RESTIC_REPOSITORY=rest:"+u.String(), "RESTIC_PASSWORD="+repoPassword)
-	run := func(args ...string) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, p.Restic, args...)
-		cmd.Env = env
+	return "rest:" + u.String(), nil
+}
+
+func resticRunner(ctx context.Context, bin string, env ...string) func(args ...string) ([]byte, error) {
+	full := append(os.Environ(), env...)
+	return func(args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Env = full
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
@@ -229,24 +264,79 @@ func (p *Pruner) Prune(ctx context.Context, user, repoPassword, tag string, keep
 		}
 		return out, nil
 	}
-	if _, err := run("forget", "--tag", tag, "--keep-daily", fmt.Sprint(keepDaily), "--prune"); err != nil {
+}
+
+// Replicator copies each service's repository from the primary site's admin endpoint to an off-site
+// (e.g. Abuja) restic REST server. The copy target runs --append-only, so nothing that reached it can be
+// deleted through the platform; its retention is an operator decision.
+type Replicator struct {
+	From   string // SPADE_BACKUP_ADMIN_REPO
+	To     string // SPADE_BACKUP_REPLICA_REPO
+	Restic string
+}
+
+func (r *Replicator) Configured() bool {
+	return r != nil && r.From != "" && r.To != "" && r.Restic != ""
+}
+
+// Copy brings the off-site repository up to date with every snapshot carrying tag and returns the
+// snapshot IDs now present off-site. The off-site repository uses the same password and chunker
+// parameters, so copies deduplicate.
+func (r *Replicator) Copy(ctx context.Context, user, repoPassword, tag string) ([]string, error) {
+	if !r.Configured() {
+		return nil, errors.New("backup replication unavailable: SPADE_BACKUP_REPLICA_REPO not configured")
+	}
+	if !userRe.MatchString(user) {
+		return nil, fmt.Errorf("invalid backup login %q", user)
+	}
+	from, err := adminRepo(r.From, "SPADE_BACKUP_ADMIN_REPO", user)
+	if err != nil {
+		return nil, err
+	}
+	to, err := adminRepo(r.To, "SPADE_BACKUP_REPLICA_REPO", user)
+	if err != nil {
+		return nil, err
+	}
+	run := resticRunner(ctx, r.Restic, "RESTIC_REPOSITORY="+to, "RESTIC_PASSWORD="+repoPassword,
+		"RESTIC_FROM_REPOSITORY="+from, "RESTIC_FROM_PASSWORD="+repoPassword)
+	if _, err := run("cat", "config"); err != nil {
+		if _, ierr := run("init", "--copy-chunker-params"); ierr != nil {
+			return nil, fmt.Errorf("off-site repository: %v (after %v)", ierr, err)
+		}
+	}
+	if _, err := run("copy", "--tag", tag); err != nil {
 		return nil, err
 	}
 	out, err := run("snapshots", "--json", "--tag", tag)
 	if err != nil {
 		return nil, err
 	}
-	var snaps []struct {
-		ID string `json:"id"`
+	return snapshotIDs(out)
+}
+
+// ProbeAdmin checks that an admin endpoint (name is its env var) accepts its credentials.
+func ProbeAdmin(ctx context.Context, hc *http.Client, raw, name string) error {
+	if _, err := adminRepo(raw, name, "s-00000000-0000-0000-0000-000000000000"); err != nil {
+		return err
 	}
-	if err := json.Unmarshal(out, &snaps); err != nil {
-		return nil, fmt.Errorf("restic snapshots: %w", err)
+	u, _ := url.Parse(strings.TrimPrefix(raw, "rest:"))
+	pw, _ := u.User.Password()
+	user := u.User.Username()
+	u.User = nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
 	}
-	kept := make([]string, 0, len(snaps))
-	for _, s := range snaps {
-		kept = append(kept, s.ID)
+	req.SetBasicAuth(user, pw)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s unreachable: %w", name, err)
 	}
-	return kept, nil
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%s credentials rejected (HTTP %d)", name, resp.StatusCode)
+	}
+	return nil
 }
 
 func loopback(host string) bool {
