@@ -32,4 +32,7 @@ var (
 	OIDCIssuer  = func() string { return Get("OIDC_ISSUER", "http://localhost:8180/realms/spadeai") }
 	Permify     = func() string { return Get("PERMIFY_URL", "http://localhost:3476") }
 	CADir       = func() string { return Get("SPADE_CA_DIR", "./.spade/ca") }
+	// KEKFile holds the 32-byte key-encryption key. Local dev auto-creates it; production must mount it
+	// from a KMS/Vault and set SPADE_KEK_CREATE=false so a missing key fails closed.
+	KEKFile = func() string { return Get("SPADE_KEK_FILE", "./.spade/kek") }
 )

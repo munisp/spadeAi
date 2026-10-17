@@ -7,6 +7,8 @@ type Wallet = { arrears_minor: number; balance: { available_minor: number; pendi
 type Project = { id: string; name: string; org_id: string; overlay_kind?: string };
 type Template = { slug: string; name: string; version: string; description: string };
 type Service = { id: string; display_name: string; template: string; state: string; state_reason: string | null };
+type OverlayPeer = { service_id: string; display_name: string; overlay_ip: string; endpoint: string; last_apply_status: string | null; applied_generation: number | null };
+type Overlay = { kind: string; cidr: string; generation: number; peers: OverlayPeer[] };
 
 const s = {
   page: { fontFamily: "system-ui, sans-serif", maxWidth: 960, margin: "0 auto", padding: 16 } as const,
@@ -27,6 +29,7 @@ export function App() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [bootstrap, setBootstrap] = useState("");
+  const [overlay, setOverlay] = useState<Overlay | null>(null);
 
   const guard = (f: () => Promise<void>) => () => { setErr(""); f().catch(e => setErr(String(e.message ?? e))); };
 
@@ -51,6 +54,7 @@ export function App() {
     setProject(p); setBootstrap("");
     setTemplates((await call<{ items: Template[] }>("/v1/templates")).items ?? []);
     setServices((await call<{ items: Service[] }>(`/v1/projects/${p.id}/services`)).items ?? []);
+    setOverlay(await call<Overlay>(`/v1/projects/${p.id}/overlay`));
   };
   const deploy = async (t: Template) => {
     const name = prompt(`Name for ${t.name}`, t.slug); if (!name) return;
@@ -113,6 +117,14 @@ export function App() {
           <b>{v.display_name}</b> ({v.template}) <span style={s.pill(v.state === "running")}>{v.state}</span> {v.state_reason && <small>{v.state_reason}</small>}
           {["start", "stop", "restart", "delete"].map(a => <button key={a} style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => act(v, a))}>{a}</button>)}
         </div>)}
+        {overlay && <div style={{ marginTop: 8 }}>
+          <h4>Private network ({overlay.kind}, {overlay.cidr})</h4>
+          {overlay.peers.length === 0 && <p>No hosts have joined yet.</p>}
+          {(overlay.peers ?? []).map(p => {
+            const inSync = p.last_apply_status === "succeeded" && p.applied_generation === overlay.generation;
+            return <div key={p.service_id}><b>{p.display_name}</b> {p.overlay_ip} <span style={s.pill(inSync)}>{inSync ? "in sync" : (p.last_apply_status ?? "pending")}</span></div>;
+          })}
+        </div>}
         {bootstrap && <div style={{ ...s.card, background: "#f0fdfa" }}><b>Run on your VM to attach it (expires in 15 min):</b><pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{bootstrap}</pre></div>}
         <h4>Catalogue (tested versions only)</h4>
         {templates.map(t => <div key={t.slug}><b>{t.name}</b> {t.version} — {t.description} <button style={s.btn} onClick={guard(() => deploy(t))}>Deploy</button></div>)}

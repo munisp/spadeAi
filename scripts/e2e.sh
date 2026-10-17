@@ -37,15 +37,20 @@ ET=$(sed -E 's/.*SPADE_ENROL_TOKEN=([0-9a-f]+).*/\1/' <<<"$BOOT")
 [ "$(wallet "$ORG" | j "d['balance']['pending_debits_minor']")" -gt 0 ] || fail "funds-check hold not placed"
 ST=$(mktemp -d); ./rust/target/release/spade-agent enrol --gateway "$GW" --ca .spade/ca/ca.crt --token "$ET" --state-dir "$ST"
 ./rust/target/release/spade-agent enrol --gateway "$GW" --ca .spade/ca/ca.crt --token "$ET" --state-dir "$(mktemp -d)" 2>/dev/null && fail "enrolment token reused"
-./rust/target/release/spade-agent run --gateway "$GW" --state-dir "$ST" --stacks-dir "$ST/stacks" >"$ST/agent.log" 2>&1 & AGENT=$!
+# The agent runs as root on real hosts (systemd): it creates the project's overlay interface.
+sudo -n ./rust/target/release/spade-agent run --gateway "$GW" --state-dir "$ST" --stacks-dir "$ST/stacks" >"$ST/agent.log" 2>&1 &
 SVC=""
-cleanup() { kill $AGENT 2>/dev/null || true; [ -n "$SVC" ] && docker compose -p "spade-${SVC:0:8}" down >/dev/null 2>&1 || true; }
+cleanup() { sudo -n pkill -f "spade-agent run --gateway $GW --state-dir $ST" 2>/dev/null || true; sudo -n ip link del "spw-${PRJ:0:8}" 2>/dev/null || true
+  [ -n "$SVC" ] && docker compose -p "spade-${SVC:0:8}" down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 for _ in $(seq 120); do S=$(curl -sf "${H[@]}" "$API/v1/operations/$OP" | j "d['status']"); [ "$S" = succeeded ] && break; [ "$S" = failed ] && fail "deploy failed"; sleep 1; done
 [ "$S" = succeeded ] || fail "deploy timed out"
 W=$(wallet "$ORG"); [ "$(j "d['balance']['pending_debits_minor']" <<<"$W")" = 0 ] || fail "hold not voided after deploy"
 [ "$(j "d['balance']['posted_balance_minor']" <<<"$W")" = 5000000 ] || fail "hold was charged"
-echo "PASS deploy: agent enrolled, bundle applied, health ok, hold voided, no double charge"
+SVC=$(curl -sf "${H[@]}" "$API/v1/projects/$PRJ/services" | j "d['items'][0]['id']")
+OIP=$(curl -sf "${H[@]}" "$API/v1/services/$SVC" | j "d['overlay_ip'] or ''"); [ -n "$OIP" ] || fail "service has no overlay IP"
+ip -4 addr show "spw-${PRJ:0:8}" | grep -q "inet $OIP/" || fail "overlay interface not configured with $OIP"
+echo "PASS deploy: agent enrolled, joined wireguard overlay ($OIP), bundle applied, health ok, hold voided, no double charge"
 
 SVC=$(curl -sf "${H[@]}" "$API/v1/projects/$PRJ/services" | j "d['items'][0]['id']")
 HOUR=$(date -u -d '-1 hour' +%Y-%m-%dT%H:00:00Z)

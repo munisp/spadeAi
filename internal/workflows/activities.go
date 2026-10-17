@@ -17,9 +17,11 @@ import (
 
 	"github.com/munisp/spadeai/internal/audit"
 	"github.com/munisp/spadeai/internal/ledger"
+	"github.com/munisp/spadeai/internal/overlay"
 )
 
 type Activities struct {
+	Overlay   *overlay.Controller // nil disables private networks (deploys into projects then fail closed)
 	Pool      *pgxpool.Pool
 	Ledger    *ledger.Ledger
 	HoldHours int64
@@ -209,6 +211,12 @@ func (a *Activities) QueueCommand(ctx context.Context, serviceID, verb string) (
 		payload["compose"], payload["compose_sha256"], payload["env"] = compose, sha, e
 	case "health_probe":
 		payload["health"] = m["health"]
+	case "overlay_keygen", "overlay_down":
+		var projectID, kind string
+		if err := a.Pool.QueryRow(ctx, `SELECT p.id::text, p.overlay_kind FROM service s JOIN project p ON p.id=s.project_id WHERE s.id=$1`, serviceID).Scan(&projectID, &kind); err != nil {
+			return "", err
+		}
+		payload["kind"], payload["iface"], payload["listen_port"] = kind, overlay.Iface(kind, projectID), overlay.Port(kind)
 	}
 	b, _ := json.Marshal(payload)
 	var id string
@@ -302,4 +310,62 @@ func collect(ctx context.Context, tx pgx.Tx, q string, args ...any) ([]string, e
 		out = []string{}
 	}
 	return out, err
+}
+
+// OverlayRegister reads the host's overlay_keygen result and records it in the project's overlay
+// (stable IP allocation; Nebula host certificate signing). Returns the project ID.
+func (a *Activities) OverlayRegister(ctx context.Context, serviceID, keygenCmd string) (string, error) {
+	if a.Overlay == nil {
+		return "", nonRetryable("overlay controller not configured")
+	}
+	var raw []byte
+	if err := a.Pool.QueryRow(ctx, `SELECT result FROM agent_command WHERE id=$1 AND status='succeeded'`, keygenCmd).Scan(&raw); err != nil {
+		return "", err
+	}
+	var r struct {
+		PublicKey string `json:"public_key"`
+		Endpoint  string `json:"endpoint"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil || r.PublicKey == "" {
+		return "", nonRetryable("overlay_keygen returned no public key")
+	}
+	pid, err := a.Overlay.Register(ctx, serviceID, r.PublicKey, r.Endpoint)
+	if errors.Is(err, overlay.ErrNebulaUnavailable) {
+		return "", nonRetryable("%v", err)
+	}
+	return pid, err
+}
+
+// OverlaySync queues overlay_apply for every enrolled member of the project; returns service -> command ID.
+func (a *Activities) OverlaySync(ctx context.Context, projectID string) (map[string]string, error) {
+	if a.Overlay == nil {
+		return nil, nonRetryable("overlay controller not configured")
+	}
+	plans, err := a.Overlay.Plan(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for svc, p := range plans {
+		b, _ := json.Marshal(p)
+		var id string
+		err := a.Pool.QueryRow(ctx, `INSERT INTO agent_command(agent_id, verb, payload) SELECT id, 'overlay_apply', $2 FROM agent
+			WHERE service_id=$1 AND cert_fingerprint IS NOT NULL RETURNING id::text`, svc, b).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[svc] = id
+	}
+	return out, nil
+}
+
+// OverlayRemove drops the service from its overlay; returns the project ID ("" if it was not a member).
+func (a *Activities) OverlayRemove(ctx context.Context, serviceID string) (string, error) {
+	if a.Overlay == nil {
+		return "", nil
+	}
+	return a.Overlay.Remove(ctx, serviceID)
 }

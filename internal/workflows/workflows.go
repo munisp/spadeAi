@@ -76,6 +76,9 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 	if err := workflow.ExecuteActivity(waiting(ctx, AgentWait), a.WaitForAgent, serviceID).Get(ctx, nil); err != nil {
 		return fail("agent_enrolment", err)
 	}
+	if err := joinOverlay(ctx, a, serviceID); err != nil {
+		return fail("overlay", err)
+	}
 	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "installing_app", "").Get(ctx, nil); err != nil {
 		return fail("state", err)
 	}
@@ -99,6 +102,39 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 
 // AgentWait slightly exceeds the 15-minute single-use enrolment token lifetime.
 var AgentWait = 16 * time.Minute
+
+// joinOverlay: host generates its key -> control plane allocates IP (and signs a Nebula cert) -> mesh resync.
+func joinOverlay(ctx workflow.Context, a *Activities, serviceID string) error {
+	var keyCmd string
+	if err := workflow.ExecuteActivity(short(ctx), a.QueueCommand, serviceID, "overlay_keygen").Get(ctx, &keyCmd); err != nil {
+		return err
+	}
+	if err := workflow.ExecuteActivity(waiting(ctx, 15*time.Minute), a.WaitCommand, keyCmd).Get(ctx, nil); err != nil {
+		return err
+	}
+	var projectID string
+	if err := workflow.ExecuteActivity(short(ctx), a.OverlayRegister, serviceID, keyCmd).Get(ctx, &projectID); err != nil {
+		return err
+	}
+	return syncOverlay(ctx, a, projectID, serviceID)
+}
+
+// syncOverlay pushes the current mesh to every member. Only `must`'s own apply is awaited; other members
+// apply asynchronously and report through GET /v1/projects/{id}/overlay (an offline host converges on its next sync).
+func syncOverlay(ctx workflow.Context, a *Activities, projectID, must string) error {
+	var cmds map[string]string
+	if err := workflow.ExecuteActivity(short(ctx), a.OverlaySync, projectID).Get(ctx, &cmds); err != nil {
+		return err
+	}
+	id, ok := cmds[must]
+	if must == "" {
+		return nil
+	}
+	if !ok {
+		return fmt.Errorf("service %s has no enrolled agent for overlay apply", must)
+	}
+	return workflow.ExecuteActivity(waiting(ctx, 15*time.Minute), a.WaitCommand, id).Get(ctx, nil)
+}
 
 func runCommand(ctx workflow.Context, a *Activities, serviceID, verb string) error {
 	var cmdID string
@@ -132,6 +168,14 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 		}
 		_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
 		return err
+	}
+	if action == "delete" {
+		// Best effort: the host may already be gone. Remaining members are resynced without this peer.
+		_ = runCommand(ctx, a, serviceID, "overlay_down")
+		var projectID string
+		if err := workflow.ExecuteActivity(sctx, a.OverlayRemove, serviceID).Get(ctx, &projectID); err == nil && projectID != "" {
+			_ = syncOverlay(ctx, a, projectID, "")
+		}
 	}
 	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, final, "").Get(ctx, nil); err != nil {
 		return err

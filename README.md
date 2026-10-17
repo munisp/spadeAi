@@ -45,6 +45,8 @@ export SPADE_INTERNAL_SECRET=$(openssl rand -hex 32)   # >= 32 chars or the paym
 ./bin/spade-worker &
 ./scripts/e2e.sh
 ```
+`scripts/e2e-overlay.sh` builds two privileged docker-in-docker "VMs" per overlay kind and checks WireGuard and Nebula end to end. It needs `wireguard-tools`, `nebula`/`nebula-cert` (1.9.x), the `x86_64-unknown-linux-musl` Rust target, and the gateway started with `GATEWAY_HOSTS=localhost,127.0.0.1,172.31.250.1`.
+
 `scripts/e2e.sh` runs a real deploy through the Rust agent, then checks the funds-check hold is voided, that a rejected debit suspends the org and records arrears, that a top-up settles arrears and resumes the org, and that the audit chain is intact.
 
 The signed payment-credit hook (`/internal/payments/verified`) is served only on `SPADE_INTERNAL_LISTEN` (default `127.0.0.1:8081`), never on the public listener. Point the payments service at it with `CORE_INTERNAL_URL`.

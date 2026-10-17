@@ -71,6 +71,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/v1/projects", s.listProjects)
 		r.Post("/v1/projects/{project}/members", s.addMember)
 		r.Get("/v1/projects/{project}/services", s.listServices)
+		r.Get("/v1/projects/{project}/overlay", s.getOverlay)
 		r.Post("/v1/projects/{project}/services", s.createService)
 		r.Get("/v1/services/{service}", s.getService)
 		r.Post("/v1/services/{service}/actions/{action}", s.serviceAction)
@@ -383,6 +384,30 @@ func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {
 	s.queryJSON(w, r, `SELECT s.id, s.display_name, s.state, s.state_reason, s.provider_id, s.size_id, host(s.ipv4) AS ipv4, t.slug AS template, tv.version
 		FROM service s JOIN template_version tv ON tv.id=s.template_version_id JOIN template t ON t.id=tv.template_id
 		WHERE s.project_id=$1 AND s.deleted_at IS NULL ORDER BY s.created_at`, p)
+}
+
+// getOverlay reports the project's private network: members, overlay IPs and each host's latest apply.
+func (s *Server) getOverlay(w http.ResponseWriter, r *http.Request) {
+	p := chi.URLParam(r, "project")
+	if !s.allow(w, r, "project", p, "view") {
+		return
+	}
+	proj, err := s.one(r.Context(), `SELECT id, overlay_kind AS kind, overlay_cidr::text AS cidr, overlay_generation AS generation FROM project WHERE id=$1`, p)
+	if err != nil {
+		writeErr(w, 404, "not_found", "project not found")
+		return
+	}
+	peers, err := s.rows(r.Context(), `SELECT o.service_id, s.display_name, host(o.overlay_ip) AS overlay_ip, o.endpoint, o.updated_at AS joined_at,
+		c.status AS last_apply_status, (c.payload->>'generation')::bigint AS applied_generation, c.updated_at AS last_apply_at
+		FROM overlay_peer o JOIN service s ON s.id=o.service_id LEFT JOIN agent a ON a.service_id=o.service_id
+		LEFT JOIN LATERAL (SELECT status, payload, updated_at FROM agent_command WHERE agent_id=a.id AND verb='overlay_apply' ORDER BY created_at DESC LIMIT 1) c ON true
+		WHERE o.project_id=$1 ORDER BY o.overlay_ip`, p)
+	if err != nil {
+		writeErr(w, 500, "internal", err.Error())
+		return
+	}
+	proj["peers"] = peers
+	writeJSON(w, 200, proj)
 }
 
 func (s *Server) getService(w http.ResponseWriter, r *http.Request) {

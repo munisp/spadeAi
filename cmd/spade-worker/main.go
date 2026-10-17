@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 	"github.com/munisp/spadeai/internal/config"
 	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
+	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/secrets"
 	"github.com/munisp/spadeai/internal/workflows"
 )
 
@@ -53,6 +56,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 	led := &ledger.Ledger{TB: tbc, Pool: pool}
 	acts := &workflows.Activities{Pool: pool, Ledger: led, HoldHours: config.Int("SPADE_HOLD_HOURS", 24),
 		GatewayURL: config.Get("GATEWAY_PUBLIC_URL", "https://localhost:8443"), CAPin: ca.Pin()}
+	kek, err := secrets.LoadOrCreate(config.KEKFile(), config.Get("SPADE_KEK_CREATE", "true") == "true")
+	if err != nil {
+		log.Warn("KEK unavailable: Nebula overlays and backups disabled", "err", err)
+		kek = nil
+	}
+	nebulaCert, _ := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert"))
+	acts.Overlay = &overlay.Controller{Pool: pool, KEK: kek, NebulaCert: nebulaCert}
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"time"
 
@@ -162,7 +163,17 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 		c.Register("provider."+p, func(context.Context) (string, string) { return "unavailable", "driver not implemented" })
 	}
 	c.Register("provider.byovm", func(context.Context) (string, string) { return "available", "" })
-	c.Register("overlay.wireguard", func(context.Context) (string, string) { return "unavailable", "overlay controller not implemented" })
-	c.Register("overlay.nebula", func(context.Context) (string, string) { return "unavailable", "overlay controller not implemented" })
+	c.Register("overlay.wireguard", func(context.Context) (string, string) {
+		return "available", "hosts need the wireguard kernel module and wireguard-tools"
+	})
+	c.Register("overlay.nebula", func(context.Context) (string, string) {
+		if _, err := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert")); err != nil {
+			return "unavailable", "nebula-cert not installed on the control plane"
+		}
+		if _, err := os.Stat(config.KEKFile()); err != nil {
+			return "unavailable", "KEK not present (SPADE_KEK_FILE); CA keys cannot be sealed"
+		}
+		return "available", "hosts need the nebula binary"
+	})
 	c.Register("backups", func(context.Context) (string, string) { return "unavailable", "backup orchestration not implemented" })
 }

@@ -110,6 +110,7 @@ const usage = `spade — SpadeAi CLI
   spade templates
   spade deploy PROJECT_ID TEMPLATE NAME SIZE
   spade services PROJECT_ID
+  spade overlay PROJECT_ID          (private network members, IPs, sync state)
   spade action SERVICE_ID start|stop|restart|delete
   spade op OPERATION_ID [--wait]
   spade audit verify`
@@ -217,6 +218,11 @@ func run(a []string) error {
 			}
 			time.Sleep(2 * time.Second)
 		}
+	case "overlay":
+		if err := need(2); err != nil {
+			return err
+		}
+		return show(call(c, "GET", "/v1/projects/"+url.PathEscape(a[1])+"/overlay", nil, false))
 	case "audit":
 		return show(call(c, "GET", "/v1/audit-events/verify", nil, false))
 	}

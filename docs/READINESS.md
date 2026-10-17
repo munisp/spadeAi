@@ -1,6 +1,6 @@
 # Production readiness
 
-**Overall: about 35/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM. It is not a production platform yet.
+**Overall: about 40/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM, plus per-project private networks (WireGuard and Nebula) between hosts. It is not a production platform yet.
 
 ## Verified locally (scripts/e2e.sh plus unit tests)
 | Area | Evidence |
@@ -13,12 +13,12 @@
 | Billing | TigerBeetle pending hold used as a funds check and voided after deploy (no double charge); hourly metering; rating; `exceeds_credits` suspends the org and records arrears; a top-up settles arrears oldest first and resumes the org |
 | Capabilities | `/v1/capabilities` reports every integration; anything unimplemented or unconfigured shows as `unavailable` |
 | Template CI | Lint rules plus a real docker smoke test before a version can be deployed |
+| Private networks | `scripts/e2e-overlay.sh`: two docker-in-docker hosts per kind. WireGuard full mesh and Nebula (lighthouse = lowest IP, per-project CA sealed with the KEK) both reach each other over the overlay; deleting a service removes it and the survivor's mesh shrinks. Host private keys never enter the command queue (checked) |
 
 ## Unavailable or not implemented (reported honestly as `unavailable`)
 | Area | State |
 |---|---|
 | Cloud drivers (Hetzner, AWS, Proxmox, OpenStack) | Not implemented. BYOVM only |
-| Nebula / WireGuard overlay controllers | Schema and API choice exist; no controller yet |
 | Backups (Borg/restic orchestration) | Not implemented |
 | Paystack / Flutterwave | Code and tests done; **no credentials configured**, so these report unavailable. Not yet verified against the live sandbox |
 | AI DevOps | Router and policy enforcement are unit-tested; no LLM backend is configured, so `/healthz` returns 503 |
@@ -26,6 +26,7 @@
 | PWA | Builds and serves; OIDC flow not yet exercised in a browser |
 | HA / DR | Single-node dev stack only. Lagos/Abuja topology is spec only |
 | APISIX, Kafka | In the spec; not wired in |
-| Security hardening | Dev credentials in compose; the API's internal gateway health probe skips TLS verification; no rate limiting; no secrets manager; no pen test |
+| Security hardening | Dev credentials in compose; the local KEK is a file auto-created under `.spade/` (production must mount it from a KMS/Vault and set `SPADE_KEK_CREATE=false`); no rate limiting; no pen test |
 | Observability | Structured logs only; no metrics or tracing |
 | Tests | Go unit tests are thin; there are no Go integration tests in CI (e2e needs the full stack) |
+| Overlay at scale | Each apply restarts Nebula only when its config changes; WireGuard uses `wg syncconf` (no tunnel drop). Not yet tested beyond two hosts, across NAT, or with IPv6 endpoints; hosts that are offline during a mesh change converge only on the next change |
