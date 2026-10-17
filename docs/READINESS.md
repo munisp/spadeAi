@@ -1,6 +1,6 @@
 # Production readiness
 
-**Overall: about 53/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack and Proxmox drivers on a shared cloud adapter, none yet live-tested), plus per-project private networks (WireGuard and Nebula) between hosts and encrypted off-host backups with restore. It is not a production platform yet.
+**Overall: about 56/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack and Proxmox drivers on a shared cloud adapter, none yet live-tested), plus per-project private networks (WireGuard and Nebula) between hosts and encrypted off-host backups with restore, copied to a second site, and a two-site (Lagos/Abuja) failover rehearsal for Postgres and TigerBeetle. It is not a production platform yet.
 
 ## Verified locally (scripts/e2e.sh plus unit tests)
 | Area | Evidence |
@@ -26,13 +26,13 @@
 | AI DevOps | Router and policy enforcement are unit-tested; no LLM backend is configured, so `/healthz` returns 503 |
 | Mobile app | Type-checks only; not run on a device or emulator |
 | PWA | Builds and serves; OIDC flow not yet exercised in a browser |
-| HA / DR | Single-node dev stack only. Lagos/Abuja topology is spec only |
+| HA / DR | Rehearsed only, on one machine (`deploy/ha`, `scripts/e2e-ha.sh`): Postgres synchronous standby in Abuja promoted after losing Lagos with no acknowledged write lost and writes back in under 1s; TigerBeetle 3 replicas (Lagos, Abuja, witness site) kept committing with Lagos down; Lagos rejoins as a standby. Missing: real separate sites and network latency, automatic failover (promotion is an operator script; no Patroni/etcd fencing), Temporal, Keycloak and Permify on the replicated Postgres (Temporal takes one Postgres host, so it needs a floating address or DNS switch), stateless API/gateway/worker running in both sites, gateway and DNS failover for agents. Capability `ha` reports `unavailable` unless a synchronous standby is streaming and 3 TigerBeetle replicas are configured |
 | APISIX, Kafka | In the spec; not wired in |
 | Security hardening | Dev credentials in compose; the local KEK is a file auto-created under `.spade/` (production must mount it from a KMS/Vault and set `SPADE_KEK_CREATE=false`); no rate limiting; no pen test |
 | Observability | Structured logs only; no metrics or tracing |
 | Tests | Go unit tests are thin; there are no Go integration tests in CI (e2e needs the full stack) |
 | Overlay at scale | Each apply restarts Nebula only when its config changes; WireGuard uses `wg syncconf` (no tunnel drop). Not yet tested beyond two hosts, across NAT, or with IPv6 endpoints; hosts that are offline during a mesh change converge only on the next change |
-| Backups hardening | Per-service logins and append-only storage are done. Missing: object-lock/WORM storage underneath (an operator with disk access can still delete; the admin endpoint can too), off-site replication of the repository (Lagos to Abuja), restore into a new service, backup billing, and tests with large volumes or long-running databases (quiesce means brief downtime) |
+| Backups hardening | Per-service logins, append-only storage and an off-site copy after every backup (`SPADE_BACKUP_REPLICA_REPO`, capability `backups.offsite`; the copy target is append-only so the platform never deletes there, and its retention is still manual) are done. Missing: object-lock/WORM storage underneath (an operator with disk access can still delete; the admin endpoint can too), restore into a new service, backup billing, and tests with large volumes or long-running databases (quiesce means brief downtime) |
 
 ### Backup hardening (review of #9)
 - The restic REST server now requires HTTP basic auth (`scripts/backup-repo-user.sh` creates the user and prints `SPADE_BACKUP_REPO`); without a user every request is 401 and the `backups` capability reports the rejected credentials. Superseded: each service now has its own append-only, private-repo login (see Backups above).

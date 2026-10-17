@@ -288,6 +288,9 @@ func BackupService(ctx workflow.Context, opID, serviceID string) error {
 	if err := workflow.ExecuteActivity(slow(ctx), a.PruneBackups, serviceID).Get(ctx, nil); err != nil {
 		res["prune_error"] = err.Error()
 	}
+	if err := workflow.ExecuteActivity(slow(ctx), a.ReplicateBackups, serviceID).Get(ctx, nil); err != nil {
+		res["offsite_error"] = err.Error()
+	}
 	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", res).Get(ctx, nil)
 }
 

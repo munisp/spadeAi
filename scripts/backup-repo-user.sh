@@ -17,3 +17,11 @@ echo "gateway (as seen from hosts): SPADE_BACKUP_REPO=rest:http://${BACKUP_REPO_
 echo "worker + api:                 SPADE_BACKUP_REPO=rest:http://127.0.0.1:8000"
 echo "worker:                       SPADE_BACKUP_HTPASSWD=$PWD/.spade/backup-auth/htpasswd"
 echo "worker + api:                 SPADE_BACKUP_ADMIN_REPO=rest:http://$user:$pw@127.0.0.1:8001"
+if [ "${BACKUP_OFFSITE:-0}" = 1 ]; then
+  # Second-site copy target from deploy/ha (compose `backups-abuja`); same admin login, worker only.
+  mkdir -p .spade/backup-abuja && touch .spade/backup-abuja/htpasswd
+  ha="docker compose -f deploy/ha/docker-compose.ha.yml"
+  $ha up -d backups-abuja >/dev/null
+  $ha exec -T backups-abuja sh -c 'delete_user "$1" >/dev/null 2>&1 || true; create_user "$1" "$2"' _ "$user" "$pw" >/dev/null
+  echo "worker + api:                 SPADE_BACKUP_REPLICA_REPO=rest:http://$user:$pw@127.0.0.1:8002"
+fi

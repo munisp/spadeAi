@@ -141,3 +141,47 @@ func TestPrunerFailsClosed(t *testing.T) {
 		t.Fatalf("restic failure must surface, got %v", err)
 	}
 }
+
+func TestReplicatorFailsClosed(t *testing.T) {
+	u, _ := User(svc)
+	if _, err := (&Replicator{}).Copy(context.Background(), u, "pw", "spade-x"); err == nil {
+		t.Fatal("unconfigured replicator must refuse")
+	}
+	for _, to := range []string{"rest:http://admin:pw@10.0.0.9:8002", "rest:https://host:8002", "http://admin:pw@127.0.0.1:8002"} {
+		r := &Replicator{From: "rest:http://admin:pw@127.0.0.1:8001", To: to, Restic: "/bin/false"}
+		if _, err := r.Copy(context.Background(), u, "pw", "spade-x"); err == nil || strings.Contains(err.Error(), "restic") {
+			t.Fatalf("%s must be refused before running restic, got %v", to, err)
+		}
+	}
+	r := &Replicator{From: "rest:http://admin:pw@127.0.0.1:8001", To: "rest:https://admin:pw@abuja.example:8002", Restic: "/bin/false"}
+	if _, err := r.Copy(context.Background(), "../etc", "pw", "spade-x"); err == nil {
+		t.Fatal("non-service login")
+	}
+	if _, err := r.Copy(context.Background(), u, "pw", "spade-x"); err == nil || !strings.Contains(err.Error(), "off-site repository") {
+		t.Fatalf("restic failure must surface, got %v", err)
+	}
+}
+
+func TestReplicatorRunsCopy(t *testing.T) {
+	dir := t.TempDir()
+	logf := dir + "/calls"
+	fake := dir + "/restic"
+	script := "#!/bin/sh\necho \"$* | $RESTIC_REPOSITORY | $RESTIC_FROM_REPOSITORY\" >> " + logf + "\n" +
+		"case \"$1\" in cat) exit 1;; snapshots) echo '[{\"id\":\"abc\"}]';; esac\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := User(svc)
+	r := &Replicator{From: "rest:http://admin:pw@127.0.0.1:8001", To: "rest:https://admin:pw@abuja.example:8002/", Restic: fake}
+	ids, err := r.Copy(context.Background(), u, "pw", "spade-x")
+	if err != nil || len(ids) != 1 || ids[0] != "abc" {
+		t.Fatalf("copy: %v %v", ids, err)
+	}
+	b, _ := os.ReadFile(logf)
+	calls := string(b)
+	for _, want := range []string{"init --copy-chunker-params", "copy --tag spade-x", "rest:https://admin:pw@abuja.example:8002/" + u + " | rest:http://admin:pw@127.0.0.1:8001/" + u} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing %q in restic calls:\n%s", want, calls)
+		}
+	}
+}

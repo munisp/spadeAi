@@ -59,6 +59,15 @@ See [docs/READINESS.md](docs/READINESS.md) for an honest production-readiness as
 
 Backups are isolated per service. The tenant restic REST server (compose `backups`) runs `--private-repos --append-only`: the worker gives each service its own login (random, sealed with the KEK, written as bcrypt to `SPADE_BACKUP_HTPASSWD`), so a host can only reach `/s-<service id>` and can never delete or rewrite snapshots. Retention runs from the worker through a second endpoint on the same storage (compose `backups-admin`, loopback only). Run `scripts/backup-repo-user.sh` after `docker compose up`: it creates the admin login and prints `SPADE_BACKUP_REPO` (credential-free; one value for the gateway as hosts see it, one for the worker and API), `SPADE_BACKUP_HTPASSWD` and `SPADE_BACKUP_ADMIN_REPO`. The worker needs restic 0.14 or newer (repository format v2; set `RESTIC` to its path). The local servers are plain HTTP, so the gateway refuses to send credentials unless `SPADE_BACKUP_ALLOW_PLAINTEXT=1` (local dev only); production repositories must be `rest:https://`. Repositories made before this change live at `/<service id>` and must be moved to `/s-<service id>` on the backup server.
 
+### Two-site HA rehearsal (Lagos / Abuja)
+
+`deploy/ha/docker-compose.ha.yml` runs, on one machine, the layout meant for separate sites:
+- **Postgres:** `pg-lagos` is the primary and `pg-abuja` a synchronous hot standby (`synchronous_standby_names = 'ANY 1 (abuja)'`), so a commit is acknowledged only once Abuja has it. Point services at both with `SPADE_DATABASE_URL=postgres://...@lagos:5432,abuja:5432/spadeai?target_session_attrs=read-write`; pgx connects to whichever is primary.
+- **TigerBeetle:** 3 replicas, one each in Lagos, Abuja and a witness site (`TB_ADDRESSES=lagos:3000,abuja:3000,witness:3000`). Two sites alone can't survive losing the one holding the majority.
+- **Backups:** `backups-abuja` is the off-site copy target. Set `SPADE_BACKUP_REPLICA_REPO` on the worker and api (`BACKUP_OFFSITE=1 scripts/backup-repo-user.sh` prints it). After each backup and retention run, the worker runs `restic copy` to it.
+
+`scripts/e2e-ha.sh` is the drill. It writes continuously, kills the Lagos Postgres and TigerBeetle nodes, promotes Abuja (`scripts/ha-failover.sh`, which fences Lagos first), and checks that every acknowledged write survived. Then it rebuilds Lagos as Abuja's standby (`scripts/ha-rejoin.sh`). Promotion is manual; there is no automatic failover yet.
+
 ### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack, Proxmox)
 All API providers share one adapter (`internal/providers/cloud`): servers are tagged with the service and enrolment attempt, so a retried deploy never creates a second server, stale attempts are removed, and deleting a service removes every server it owns. First boot (cloud-init, Ubuntu 24.04) locks the root password, installs Docker + Compose, WireGuard tools, restic and a pinned Nebula, then runs the embedded agent installer, which checks the gateway CA pin before downloading anything.
 

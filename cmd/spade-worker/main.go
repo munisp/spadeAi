@@ -73,6 +73,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	acts.BackupRepo = config.Get("SPADE_BACKUP_REPO", "")
 	resticBin, _ := exec.LookPath(config.Get("RESTIC", "restic"))
 	acts.Pruner = &backups.Pruner{AdminRepo: config.Get("SPADE_BACKUP_ADMIN_REPO", ""), Restic: resticBin}
+	acts.Replicator = &backups.Replicator{From: config.Get("SPADE_BACKUP_ADMIN_REPO", ""), To: config.Get("SPADE_BACKUP_REPLICA_REPO", ""), Restic: resticBin}
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)

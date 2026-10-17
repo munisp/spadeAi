@@ -64,6 +64,15 @@ grep -q "^$U:\$2" "$HT" || fail "no bcrypt login for $U in $HT"
 docker compose -f deploy/compose/docker-compose.yml exec -T backups test -f "/data/$U/config" || fail "repository not under /$U"
 [ "$(sql "SELECT status FROM operation WHERE id='$BOP'")" = succeeded ] || fail "backup op not succeeded"
 [ "$(sql "SELECT coalesce(response->>'prune_error','') FROM operation WHERE id='$BOP'")" = "" ] || fail "retention failed: $(sql "SELECT response->>'prune_error' FROM operation WHERE id='$BOP'")"
+if [ -n "${SPADE_BACKUP_REPLICA_REPO:-}" ]; then
+  OFF=$(sql "SELECT coalesce(response->>'offsite_error','') FROM operation WHERE id='$BOP'")
+  [ -z "$OFF" ] || fail "off-site copy failed: $OFF"
+  RAW=${SPADE_BACKUP_REPLICA_REPO#rest:}
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "${RAW%/}/$U/config")" = 200 ] || fail "no off-site repository for $U"
+  echo "PASS off-site: backup copied to the second site (/$U)"
+else
+  echo "SKIP off-site: SPADE_BACKUP_REPLICA_REPO not set for this run"
+fi
 code() { docker exec "$V" curl -s -o /dev/null -w '%{http_code}' "$@"; }
 [ "$(code http://172.31.250.1:8000/$U/config)" = 401 ] || fail "anonymous request to the tenant repository was not refused"
 [ "$(code --max-time 3 http://172.31.250.1:8001/ || true)" = 000 ] || fail "retention endpoint reachable from a tenant host"
