@@ -69,12 +69,25 @@ services:
       postgres: {condition: service_healthy}
 
   backups:
-    # restic REST server: off-host backup target. Repositories are encrypted client-side with a
-    # per-service password, so this server never sees plaintext. HTTP basic auth is on: with no user
-    # every request gets 401. Create the user with scripts/backup-repo-user.sh.
+    # restic REST server for tenant hosts: off-host backup target. Repositories are encrypted client-side
+    # with a per-service password, so this server never sees plaintext. Every service has its own login
+    # (written by the worker to SPADE_BACKUP_HTPASSWD = .spade/backup-auth/htpasswd); --private-repos keeps
+    # each login inside /<login>, and --append-only means a host cannot delete or rewrite its snapshots.
     image: restic/rest-server:0.13.0
+    environment:
+      PASSWORD_FILE: /auth/htpasswd
+      OPTIONS: --append-only --private-repos
     ports: ["8000:8000"]
-    volumes: ["backupdata:/data"]
+    volumes: ["backupdata:/data", "../../.spade/backup-auth:/auth"]
+
+  backups-admin:
+    # Same storage, not append-only: retention (forget/prune) runs here from the worker only. Bound to
+    # loopback; its single admin login is created by scripts/backup-repo-user.sh.
+    image: restic/rest-server:0.13.0
+    environment:
+      PASSWORD_FILE: /admin/htpasswd
+    ports: ["127.0.0.1:8001:8000"]
+    volumes: ["backupdata:/data", "../../.spade/backup-admin:/admin"]
 
 volumes:
   pgdata: {}

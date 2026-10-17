@@ -419,21 +419,9 @@ async fn backup_run(p: &Value, dir: &Path, project: &str) -> Result<Value> {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|v| v["message_type"] == "summary")
         .ok_or(anyhow!("restic produced no summary"))?;
-    let keep = p["keep_daily"].as_u64().unwrap_or(7).to_string();
-    restic(
-        &env,
-        &["forget", "--tag", project, "--keep-daily", &keep, "--prune"],
-    )
-    .await?;
-    // Snapshots still in the repository after pruning; the control plane retires the others.
-    let kept: Vec<Value> = serde_json::from_str::<Vec<Value>>(
-        &restic(&env, &["snapshots", "--json", "--tag", project]).await?,
-    )?
-    .into_iter()
-    .map(|s| s["id"].clone())
-    .collect();
+    // Retention runs from the control plane: this host's login is append-only and cannot delete.
     Ok(
-        json!({"snapshot_id": summary["snapshot_id"], "bytes_added": summary["data_added"], "paths": paths, "quiesced": quiesce, "kept": kept}),
+        json!({"snapshot_id": summary["snapshot_id"], "bytes_added": summary["data_added"], "paths": paths, "quiesced": quiesce}),
     )
 }
 

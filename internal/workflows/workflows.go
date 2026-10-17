@@ -283,7 +283,12 @@ func BackupService(ctx workflow.Context, opID, serviceID string) error {
 	if werr != nil {
 		return failOp(werr)
 	}
-	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", map[string]any{"backup_id": rec}).Get(ctx, nil)
+	// The snapshot is safe even if retention fails; report that instead of hiding it.
+	res := map[string]any{"backup_id": rec}
+	if err := workflow.ExecuteActivity(slow(ctx), a.PruneBackups, serviceID).Get(ctx, nil); err != nil {
+		res["prune_error"] = err.Error()
+	}
+	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", res).Get(ctx, nil)
 }
 
 // RestoreService restores a completed backup in place: stop, empty volumes, restore, start.
