@@ -24,6 +24,7 @@ type Client struct {
 func (c *Client) Name() string     { return "vultr" }
 func (c *Client) TokenEnv() string { return "SPADE_VULTR_TOKEN" }
 func (c *Client) Configured() bool { return c != nil && c.Token != "" }
+func (c *Client) InNigeria() bool  { return false }
 
 func (c *Client) api() *cloud.API {
 	base := c.BaseURL

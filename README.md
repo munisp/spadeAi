@@ -59,7 +59,7 @@ See [docs/READINESS.md](docs/READINESS.md) for an honest production-readiness as
 
 The local backup repository requires a user: run `scripts/backup-repo-user.sh` after `docker compose up` and export the printed `SPADE_BACKUP_REPO` values (one for the gateway, one for the API probe). The password is generated locally and never committed. That local repo is plain HTTP, so the gateway refuses to send credentials to it unless `SPADE_BACKUP_ALLOW_PLAINTEXT=1` (local dev only); production repositories must be `rest:https://`.
 
-### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode)
+### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack, Proxmox)
 All API providers share one adapter (`internal/providers/cloud`): servers are tagged with the service and enrolment attempt, so a retried deploy never creates a second server, stale attempts are removed, and deleting a service removes every server it owns. First boot (cloud-init, Ubuntu 24.04) locks the root password, installs Docker + Compose, WireGuard tools, restic and a pinned Nebula, then runs the embedded agent installer, which checks the gateway CA pin before downloading anything.
 
 | Provider | Token (set on `spade-api` and `spade-worker`) | Region variable (default) | Sizes |
@@ -69,4 +69,12 @@ All API providers share one adapter (`internal/providers/cloud`): servers are ta
 | Vultr | `SPADE_VULTR_TOKEN` | `SPADE_VULTR_REGION` (`jnb`, Johannesburg) | `vultr:vc2-1c-2gb`, `vc2-2c-4gb`, `vc2-4c-8gb` |
 | Akamai Cloud (Linode) | `SPADE_LINODE_TOKEN` | `SPADE_LINODE_REGION` (`gb-lon`, must support Metadata) | `linode:g6-standard-1`, `g6-standard-2`, `g6-standard-4` |
 
-`SPADE_<PROVIDER>_API` overrides the API base URL; `SPADE_VULTR_OS_ID` overrides Vultr's Ubuntu 24.04 image id (2284). `GATEWAY_PUBLIC_URL` must be an internet-reachable `https://host[:port]` because the new server enrols itself. Without a token a provider reports `unavailable` in `/v1/capabilities` and its deploys fail closed. None of these providers has a Nigerian region, so residency-locked organisations are refused (`provider.in_nigeria`).
+| AWS EC2 | `SPADE_AWS_ACCESS_KEY_ID` + `SPADE_AWS_SECRET_ACCESS_KEY`, and `SPADE_AWS_AMI` (Ubuntu 24.04 AMI for the region) | `SPADE_AWS_REGION` (`af-south-1`, Cape Town) | `aws:t3.small`, `t3.medium`, `t3.large` |
+| OpenStack (Nova) | `SPADE_OPENSTACK_AUTH_URL` (Keystone v3), `SPADE_OPENSTACK_APP_CRED_ID` + `SPADE_OPENSTACK_APP_CRED_SECRET`, `SPADE_OPENSTACK_IMAGE` | `SPADE_OPENSTACK_REGION` | `openstack:m1.small`, `m1.medium`, `m1.large` (flavor names; must exist on the cloud) |
+| Proxmox VE | `SPADE_PROXMOX_API` (`https://host:8006/api2/json`), `SPADE_PROXMOX_TOKEN` (`user@realm!id=secret`), `SPADE_PROXMOX_NODE`, `SPADE_PROXMOX_TEMPLATE` (vmid) | n/a | `proxmox:SMALL-1C-2G`, `MEDIUM-2C-4G`, `LARGE-4C-8G` |
+
+AWS uses only the `SPADE_AWS_*` keys (never the ambient AWS credential chain); optional `SPADE_AWS_SUBNET_ID` and comma-separated `SPADE_AWS_SECURITY_GROUP_IDS`. Instances require IMDSv2 and use the attempt as the EC2 client token. OpenStack servers are tagged with Nova microversion 2.52; `SPADE_OPENSTACK_NETWORK` picks a network id (default: auto-allocate). Proxmox clones the template (linked clone; `SPADE_PROXMOX_FULL_CLONE=1` with optional `SPADE_PROXMOX_STORAGE`, plus `SPADE_PROXMOX_POOL`), so the template must be Ubuntu 24.04 with `qemu-guest-agent` installed and enabled. Proxmox cannot take cloud-init user data over the API, so the same first boot runs as a shell script through the guest agent; it must exit 0 within 15 minutes or the VM is destroyed, and only then is the VM tagged `spade-ready`. Use `SPADE_PROXMOX_CA_FILE` for a self-signed node certificate. Delete refuses any VM not tagged `spade-managed`.
+
+OpenStack and Proxmox are often run in Nigerian data centres: set `SPADE_OPENSTACK_IN_NIGERIA=1` / `SPADE_PROXMOX_IN_NIGERIA=1` to declare that, and the API writes `provider.in_nigeria` on start so residency-locked organisations may use them. Unset, they are treated as outside Nigeria. AWS is never in Nigeria.
+
+`SPADE_<PROVIDER>_API` overrides the API base URL; `SPADE_VULTR_OS_ID` overrides Vultr's Ubuntu 24.04 image id (2284). `GATEWAY_PUBLIC_URL` must be an internet-reachable `https://host[:port]` because the new server enrols itself. Without a token a provider reports `unavailable` in `/v1/capabilities` and its deploys fail closed. Hetzner, DigitalOcean, Vultr, Linode and AWS have no Nigerian region, so residency-locked organisations are refused (`provider.in_nigeria`).

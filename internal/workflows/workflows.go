@@ -54,6 +54,13 @@ func short(ctx workflow.Context) workflow.Context {
 		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5, NonRetryableErrorTypes: []string{"NonRetryable"}}})
 }
 
+// slow covers provider calls that wait on the infrastructure: Proxmox clones and runs first boot inside
+// Create, and stops the VM before deleting it. Retries are safe because drivers reconcile by tag.
+func slow(ctx workflow.Context) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: 25 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 3, NonRetryableErrorTypes: []string{"NonRetryable"}}})
+}
+
 func waiting(ctx workflow.Context, d time.Duration) workflow.Context {
 	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: d, HeartbeatTimeout: 30 * time.Second,
 		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 1}})
@@ -73,7 +80,7 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 		_ = workflow.ExecuteActivity(dctx, a.VoidHold, serviceID).Get(dctx, nil)
 		reason := fmt.Sprintf("%s: %v", stage, cause)
 		// A failed deploy must not leave a provider server running (and billing the customer's account).
-		if err := workflow.ExecuteActivity(dctx, a.Deprovision, serviceID).Get(dctx, nil); err != nil {
+		if err := workflow.ExecuteActivity(slow(dctx), a.Deprovision, serviceID).Get(dctx, nil); err != nil {
 			reason += "; cleanup failed, provider server may still exist: " + err.Error()
 		}
 		_ = workflow.ExecuteActivity(dctx, a.SetState, serviceID, "failed", reason).Get(dctx, nil)
@@ -87,7 +94,7 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 		return fail("state", err)
 	}
 	var prov ProvisionResult
-	if err := workflow.ExecuteActivity(sctx, a.Provision, serviceID).Get(ctx, &prov); err != nil {
+	if err := workflow.ExecuteActivity(slow(ctx), a.Provision, serviceID).Get(ctx, &prov); err != nil {
 		return fail("provision", err)
 	}
 	_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "running", info.WorkflowExecution.ID, "", map[string]any{"bootstrap": prov.Bootstrap, "enrol_expires_at": prov.EnrolExpiresAt}).Get(ctx, nil)
@@ -199,7 +206,7 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 		}
 		// Containers are down; a server we failed to delete would keep costing the customer, so the
 		// service stays visible as stopped with the error instead of reporting deleted.
-		if err := workflow.ExecuteActivity(sctx, a.Deprovision, serviceID).Get(ctx, nil); err != nil {
+		if err := workflow.ExecuteActivity(slow(ctx), a.Deprovision, serviceID).Get(ctx, nil); err != nil {
 			_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, "stopped", "deprovision failed: "+err.Error()).Get(ctx, nil)
 			_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
 			return err

@@ -13,9 +13,15 @@ import (
 // good uses a valid token, bad a rejected one, and unset none.
 func Contract(t *testing.T, good, bad, unset cloud.Driver) {
 	t.Helper()
+	ContractSize(t, good.Name()+"-size", good, bad, unset)
+}
+
+// ContractSize is Contract for drivers that parse the size code.
+func ContractSize(t *testing.T, size string, good, bad, unset cloud.Driver) {
+	t.Helper()
 	ctx := context.Background()
-	o := cloud.CreateOpts{ServiceID: "0123456789abcdef-svc", Attempt: "a1b2c3d4", Size: good.Name() + "-size", UserData: cloud.CloudInit(cloud.Boot{Run: "echo hi"})}
-	other := cloud.CreateOpts{ServiceID: "0123456789abcdef-other", Attempt: "ffff0000", Size: o.Size, UserData: o.UserData}
+	o := cloud.CreateOpts{ServiceID: "0123456789abcdef-svc", Attempt: "a1b2c3d4", Size: size, UserData: cloud.CloudInit(cloud.Boot{Run: "echo hi"}), Script: cloud.Script(cloud.Boot{Run: "echo hi"})}
+	other := cloud.CreateOpts{ServiceID: "0123456789abcdef-other", Attempt: "ffff0000", Size: o.Size, UserData: o.UserData, Script: o.Script}
 	if _, _, err := cloud.Ensure(ctx, good, other); err != nil {
 		t.Fatalf("other service: %v", err)
 	}

@@ -1,6 +1,9 @@
 package cloud
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -24,5 +27,27 @@ func TestFromTagsNeedsServiceTag(t *testing.T) {
 	}
 	if _, ok := FromTags([]string{ServiceTag("s10"), AttemptTag("a1")}, "s1"); ok {
 		t.Fatal("a different service's tag must not match")
+	}
+}
+
+func TestScriptRunsBootInOrder(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	f := filepath.Join(dir, "it's here.sh")
+	sc := Script(Boot{Files: map[string]string{f: "echo \"file $1\" >> " + out + "\n"},
+		Pre: []string{"echo pre > " + out}, Run: "sh '" + strings.ReplaceAll(f, "'", `'"'"'`) + "' 'a;b'"})
+	cmd := exec.Command("sh", "-c", sc)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script failed: %v %s\n%s", err, b, sc)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "pre\nfile a;b\n" {
+		t.Fatalf("got %q", got)
+	}
+	if fail := Script(Boot{Pre: []string{"false"}, Run: "touch " + filepath.Join(dir, "ran")}); exec.Command("sh", "-c", fail).Run() == nil {
+		t.Fatal("a failing step must stop the script")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
+		t.Fatal("steps after a failure must not run")
 	}
 }
