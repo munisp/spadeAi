@@ -55,7 +55,7 @@ Evidence IDs refer to `00-evidence-ledger.md`. **Stack constraints:**
 | CI/CD | `CRUD /pipelines`, `POST /pipelines/{id}/runs`, `GET /pipeline-runs/{id}/logs` (SSE), `CRUD /registries`, `POST /webhooks/git/{provider}` (HMAC-verified) | cicd/* |
 | Storage | `CRUD /buckets`, `CRUD /buckets/{id}/keys`, lifecycle, cors, notifications | object storage |
 | Monitoring | `GET /services/{id}/metrics?series=&from=&to=`, `CRUD /alert-rules`, `GET /services/{id}/events` | monitoring backend (E1) |
-| AI DevOps (self-hosted LLM by default; external providers opt-in per org) | `POST /services/{id}/ai-sessions`, `POST /ai-sessions/{id}:approve-access`, SSE transcript | AI DevOps (E25) |
+| AI DevOps (dual LLM backends: self-hosted and external, routed per org policy) | `POST /services/{id}/ai-sessions`, `POST /ai-sessions/{id}:approve-access`, SSE transcript | AI DevOps (E25) |
 | Billing | `GET /billing/wallet`, `POST /billing/topups` (Paystack/Flutterwave/Remita/Stripe), `GET /billing/usage?project=`, `GET /invoices`, `PUT /billing/auto-refill` | billings/* |
 | Audit | `GET /audit-events?target=` | getAudits |
 | Health | `GET /capabilities` returns each integration's honest state | — |
@@ -76,6 +76,10 @@ any → failed (with compensations; never reported as running)
 - **Backup / Restore:** restic or Borg (E12) to (a) local, (b) remote in-country vault, (c) customer S3. Every restore runs `preRestore`/`postRestore` hooks. A weekly **restore-verification** job restores into a scratch VM and records `verified_at`.
 - **Suspend / Delete:** the billing workflow enforces balance ≥ minimum to start (E8). At zero balance: notify, then suspend (stop the stack, keep the disk), then delete after N days with a final backup kept 14 days.
 - **AI DevOps:**
+  0. **LLM routing:** the `llm_router` picks a backend from the org's `ai_policy`: `self_hosted` (vLLM serving open-weight models in-country), `external` (OpenAI-compatible providers via an allow-list), or `hybrid` (self-hosted first, external as fallback or for complex cases).
+     - Residency-bound tenants (gov, regulated) are locked to `self_hosted`.
+     - The policy, model used and token usage are recorded per session for audit and billing.
+     - If the selected backend is down, the router fails closed: it reports `unavailable` and never silently switches to a backend the policy does not allow.
   1. LLM triage, answer-only.
   2. If shell is needed, the user approves explicitly.
   3. A pre-change snapshot is taken.
