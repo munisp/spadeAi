@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/munisp/spadeai/internal/audit"
+	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
 	"github.com/munisp/spadeai/internal/overlay"
 	"github.com/munisp/spadeai/internal/providers/hetzner"
@@ -183,29 +184,39 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 	}
 	cmd := fmt.Sprintf("curl -fsSL --insecure %s/agent/v1/install.sh | sudo SPADE_GATEWAY=%s SPADE_CA_SHA256=%s SPADE_ENROL_TOKEN=%s sh", a.GatewayURL, a.GatewayURL, a.CAPin, token)
 	if s.Provider == "hetzner" {
-		return a.provisionHetzner(ctx, serviceID, cmd, hex.EncodeToString(sum[:8]), exp)
+		return a.provisionHetzner(ctx, serviceID, token, hex.EncodeToString(sum[:8]), exp)
 	}
 	return &ProvisionResult{Bootstrap: cmd, EnrolExpiresAt: exp}, nil
 }
 
-// provisionHetzner creates the server whose cloud-init runs the bootstrap. The attempt label ties the
-// server to this enrolment token; servers from earlier attempts (stale tokens) are deleted first.
-func (a *Activities) provisionHetzner(ctx context.Context, serviceID, bootstrap, attempt string, exp time.Time) (*ProvisionResult, error) {
-	var code, ref string
-	if err := a.Pool.QueryRow(ctx, `SELECT z.code, coalesce(s.provider_ref,'') FROM service s JOIN size z ON z.id=s.size_id WHERE s.id=$1`, serviceID).Scan(&code, &ref); err != nil {
+// Host dependencies on a stock ubuntu-24.04 image: Docker + Compose for stacks, WireGuard tools and
+// pinned Nebula for overlays, restic for backups.
+var hetznerPackages = []string{"docker.io", "docker-compose-v2", "wireguard-tools", "restic", "curl", "openssl"}
+
+const nebulaInstall = `curl -fsSL -o /tmp/nebula.tgz https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz && ` +
+	`echo "af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71  /tmp/nebula.tgz" | sha256sum -c - && ` +
+	`tar -xzf /tmp/nebula.tgz -C /usr/local/bin nebula nebula-cert && rm /tmp/nebula.tgz`
+
+// provisionHetzner creates the server whose cloud-init installs host dependencies and runs the embedded
+// agent installer. The attempt label ties the server to this enrolment token.
+func (a *Activities) provisionHetzner(ctx context.Context, serviceID, token, attempt string, exp time.Time) (*ProvisionResult, error) {
+	var code string
+	if err := a.Pool.QueryRow(ctx, `SELECT z.code FROM service s JOIN size z ON z.id=s.size_id WHERE s.id=$1`, serviceID).Scan(&code); err != nil {
 		return nil, err
 	}
-	if ref != "" {
-		if _, err := a.Hetzner.Delete(ctx, serviceID); err != nil {
-			return nil, err
-		}
+	// Reconcile by label on every attempt, whether or not provider_ref was recorded.
+	if err := a.Hetzner.DeleteOthers(ctx, serviceID, attempt); err != nil {
+		return nil, err
 	}
+	run := fmt.Sprintf("SPADE_GATEWAY='%s' SPADE_CA_SHA256='%s' SPADE_ENROL_TOKEN='%s' sh /opt/spade/install.sh", a.GatewayURL, a.CAPin, token)
+	boot := hetzner.Boot{Packages: hetznerPackages, Files: map[string]string{"/opt/spade/install.sh": gateway.InstallScript()},
+		Pre: []string{"systemctl enable --now docker", nebulaInstall}, Run: run}
 	loc := a.HetznerLocation
 	if loc == "" {
 		loc = "fsn1"
 	}
 	srv, _, err := a.Hetzner.Ensure(ctx, hetzner.CreateOpts{ServiceID: serviceID, Attempt: attempt, ServerType: strings.ToLower(code),
-		Location: loc, Image: "ubuntu-24.04", UserData: hetzner.CloudInit(bootstrap)})
+		Location: loc, Image: "ubuntu-24.04", UserData: hetzner.CloudInit(boot)})
 	if err != nil {
 		return nil, err
 	}
@@ -218,13 +229,19 @@ func (a *Activities) provisionHetzner(ctx context.Context, serviceID, bootstrap,
 // Deprovision deletes provider infrastructure for API providers; BYOVM hosts belong to the customer.
 func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
 	s, err := a.info(ctx, serviceID)
-	if err != nil || s.Provider != "hetzner" {
+	if err != nil {
 		return err
 	}
-	if a.Hetzner == nil || a.Hetzner.Token == "" {
-		return nonRetryable("hetzner server for %s not deleted: SPADE_HETZNER_TOKEN not configured", serviceID)
+	if s.Provider == "hetzner" {
+		if a.Hetzner == nil || a.Hetzner.Token == "" {
+			return nonRetryable("hetzner server for %s not deleted: SPADE_HETZNER_TOKEN not configured", serviceID)
+		}
+		if _, err := a.Hetzner.Delete(ctx, serviceID); err != nil {
+			return err
+		}
 	}
-	_, err = a.Hetzner.Delete(ctx, serviceID)
+	// The host is gone or no longer managed: its agent certificate and any enrolment token stop working.
+	_, err = a.Pool.Exec(ctx, `UPDATE agent SET cert_fingerprint=NULL, enrol_token_sha256=NULL, enrol_expires_at=NULL WHERE service_id=$1`, serviceID)
 	return err
 }
 

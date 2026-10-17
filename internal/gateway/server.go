@@ -208,6 +208,10 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, p)
 }
 
+// InstallScript is the agent bootstrap; API providers embed it in first-boot user data instead of
+// fetching it, so nothing runs as root before the CA pin is checked.
+func InstallScript() string { return installScript }
+
 const installScript = `#!/bin/sh
 # SpadeAi agent bootstrap. Requires: SPADE_GATEWAY, SPADE_CA_SHA256, SPADE_ENROL_TOKEN. Docker + compose plugin must be present.
 set -eu

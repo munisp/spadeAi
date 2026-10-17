@@ -10,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,9 +30,10 @@ type Server struct {
 }
 
 type apiServer struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Status    string `json:"status"`
+	ID        int64             `json:"id"`
+	Name      string            `json:"name"`
+	Status    string            `json:"status"`
+	Labels    map[string]string `json:"labels"`
 	PublicNet struct {
 		IPv4 struct {
 			IP string `json:"ip"`
@@ -127,7 +130,7 @@ func (c *Client) Ensure(ctx context.Context, o CreateOpts) (*Server, bool, error
 		return s, false, err
 	}
 	body := map[string]any{
-		"name": "spade-" + o.ServiceID[:8], "server_type": o.ServerType, "image": o.Image, "location": o.Location,
+		"name": "spade-" + o.ServiceID[:8] + "-" + o.Attempt[:min(6, len(o.Attempt))], "server_type": o.ServerType, "image": o.Image, "location": o.Location,
 		"labels":    map[string]string{"spade-service": o.ServiceID, "spade-attempt": o.Attempt, "spade-managed": "true"},
 		"user_data": o.UserData, "start_after_create": true,
 	}
@@ -157,14 +160,63 @@ func (c *Client) Delete(ctx context.Context, serviceID string) (bool, error) {
 	return deleted, nil
 }
 
+// DeleteOthers removes the service's servers from other provisioning attempts: they carry a stale
+// enrolment token, or were created by a POST whose response was lost.
+func (c *Client) DeleteOthers(ctx context.Context, serviceID, keepAttempt string) error {
+	servers, err := c.list(ctx, Label(serviceID))
+	if err != nil {
+		return err
+	}
+	for _, s := range servers {
+		if s.Labels["spade-attempt"] == keepAttempt {
+			continue
+		}
+		if code, err := c.do(ctx, http.MethodDelete, "/servers/"+strconv.FormatInt(s.ID, 10), nil, nil); err != nil && code != http.StatusNotFound {
+			return err
+		}
+	}
+	return nil
+}
+
 // Ping verifies the token against a cheap read-only endpoint.
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodGet, "/locations", nil, nil)
 	return err
 }
 
-// CloudInit runs the agent bootstrap once on first boot.
-func CloudInit(bootstrap string) string {
-	b, _ := json.Marshal(bootstrap)
-	return "#cloud-config\nruncmd:\n  - [ sh, -c, " + string(b) + " ]\n"
+// Boot is a first-boot recipe: install packages, write files, run Pre steps, then Run.
+type Boot struct {
+	Packages []string
+	Files    map[string]string // path -> content (mode 0700)
+	Pre      []string
+	Run      string
+}
+
+// CloudInit renders Boot as cloud-config. Every value is JSON-quoted, which is valid YAML.
+func CloudInit(b Boot) string {
+	q := func(v string) string { j, _ := json.Marshal(v); return string(j) }
+	var sb strings.Builder
+	sb.WriteString("#cloud-config\npackage_update: true\n")
+	if len(b.Packages) > 0 {
+		sb.WriteString("packages:\n")
+		for _, p := range b.Packages {
+			sb.WriteString("  - " + q(p) + "\n")
+		}
+	}
+	if len(b.Files) > 0 {
+		paths := make([]string, 0, len(b.Files))
+		for p := range b.Files {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		sb.WriteString("write_files:\n")
+		for _, p := range paths {
+			sb.WriteString("  - path: " + q(p) + "\n    permissions: \"0700\"\n    content: " + q(b.Files[p]) + "\n")
+		}
+	}
+	sb.WriteString("runcmd:\n")
+	for _, c := range append(append([]string{}, b.Pre...), b.Run) {
+		sb.WriteString("  - [ sh, -c, " + q(c) + " ]\n")
+	}
+	return sb.String()
 }

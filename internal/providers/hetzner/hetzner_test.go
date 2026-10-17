@@ -75,7 +75,7 @@ func TestEnsureIsIdempotentAndDeleteRemoves(t *testing.T) {
 	defer srv.Close()
 	c := &Client{BaseURL: srv.URL, Token: "tok"}
 	ctx := context.Background()
-	o := CreateOpts{ServiceID: "0123456789abcdef", Attempt: "a1", ServerType: "cx22", Location: "fsn1", Image: "ubuntu-24.04", UserData: CloudInit("echo hi")}
+	o := CreateOpts{ServiceID: "0123456789abcdef", Attempt: "a1", ServerType: "cx22", Location: "fsn1", Image: "ubuntu-24.04", UserData: CloudInit(Boot{Run: "echo hi"})}
 	s1, created, err := c.Ensure(ctx, o)
 	if err != nil || !created || s1.IPv4 != "203.0.113.7" {
 		t.Fatalf("first ensure: %+v %v %v", s1, created, err)
@@ -88,6 +88,12 @@ func TestEnsureIsIdempotentAndDeleteRemoves(t *testing.T) {
 	o2.Attempt = "a2"
 	if s3, created, err := c.Ensure(ctx, o2); err != nil || !created || s3.ID == s1.ID {
 		t.Fatalf("new attempt must get a new server: %+v %v %v", s3, created, err)
+	}
+	if err := c.DeleteOthers(ctx, o.ServiceID, "a2"); err != nil {
+		t.Fatalf("delete others: %v", err)
+	}
+	if left, _ := c.list(ctx, Label(o.ServiceID)); len(left) != 1 || left[0].Labels["spade-attempt"] != "a2" {
+		t.Fatalf("only the current attempt's server may survive reconciliation: %+v", left)
 	}
 	if ok, err := c.Delete(ctx, o.ServiceID); err != nil || !ok {
 		t.Fatalf("delete: %v %v", ok, err)
@@ -112,8 +118,14 @@ func TestFailsClosedWithoutOrWithBadToken(t *testing.T) {
 }
 
 func TestCloudInitQuotesBootstrap(t *testing.T) {
-	ci := CloudInit(`curl -fsSL "https://gw" | sudo SPADE_X=1 sh`)
-	if !strings.Contains(ci, `"curl -fsSL \"https://gw\" | sudo SPADE_X=1 sh"`) {
-		t.Fatalf("bootstrap not JSON-quoted: %s", ci)
+	ci := CloudInit(Boot{Packages: []string{"docker.io"}, Files: map[string]string{"/opt/spade/install.sh": "#!/bin/sh\necho \"hi\"\n"},
+		Pre: []string{"echo pre"}, Run: `SPADE_X='1' sh /opt/spade/install.sh`})
+	for _, want := range []string{"packages:\n  - \"docker.io\"", `content: "#!/bin/sh\necho \"hi\"\n"`, `- [ sh, -c, "echo pre" ]`, `- [ sh, -c, "SPADE_X='1' sh /opt/spade/install.sh" ]`} {
+		if !strings.Contains(ci, want) {
+			t.Fatalf("cloud-init missing %q:\n%s", want, ci)
+		}
+	}
+	if strings.Index(ci, "echo pre") > strings.Index(ci, "install.sh\" ]") {
+		t.Fatalf("pre steps must run before the bootstrap:\n%s", ci)
 	}
 }

@@ -71,6 +71,10 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 		dctx = short(dctx)
 		_ = workflow.ExecuteActivity(dctx, a.VoidHold, serviceID).Get(dctx, nil)
 		reason := fmt.Sprintf("%s: %v", stage, cause)
+		// A failed deploy must not leave a provider server running (and billing the customer's account).
+		if err := workflow.ExecuteActivity(dctx, a.Deprovision, serviceID).Get(dctx, nil); err != nil {
+			reason += "; cleanup failed, provider server may still exist: " + err.Error()
+		}
 		_ = workflow.ExecuteActivity(dctx, a.SetState, serviceID, "failed", reason).Get(dctx, nil)
 		_ = workflow.ExecuteActivity(dctx, a.MarkOperation, opID, "failed", "", reason, nil).Get(dctx, nil)
 		return cause
