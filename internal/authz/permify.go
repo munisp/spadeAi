@@ -106,6 +106,18 @@ func (c *Client) Delete(ctx context.Context, t Tuple) error {
 	}, nil)
 }
 
+// DeleteSubject removes every relation the subject holds on the entity in a single Permify call,
+// so it either fully happens or not at all.
+func (c *Client) DeleteSubject(ctx context.Context, entityType, entityID, subjectType, subjectID string) error {
+	return c.post(ctx, "/data/delete", map[string]any{
+		"tuple_filter": map[string]any{
+			"entity":  map[string]any{"type": entityType, "ids": []string{entityID}},
+			"subject": map[string]any{"type": subjectType, "ids": []string{subjectID}},
+		},
+		"attribute_filter": map[string]any{},
+	}, nil)
+}
+
 // Check returns (false, err) on any failure so callers deny by default.
 func (c *Client) Check(ctx context.Context, entityType, entityID, permission, userID string) (bool, error) {
 	var out struct {

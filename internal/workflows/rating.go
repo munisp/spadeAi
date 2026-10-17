@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.temporal.io/sdk/client"
 
 	"github.com/munisp/spadeai/internal/ids"
@@ -118,6 +119,11 @@ func (r *Rater) Once(ctx context.Context) error {
 // settlement attempt uses a new deterministic ID derived from (original id, attempt).
 func (r *Rater) settleArrears(ctx context.Context) error {
 	pool := r.A.Pool
+	// Reconcile first: an unpaid intent whose settlement already committed is settled, and its amount
+	// is already reflected in the live wallet balance read below.
+	if err := markSettled(ctx, pool); err != nil {
+		return err
+	}
 	rows, err := pool.Query(ctx, `SELECT DISTINCT org_id::text FROM transfer_intent WHERE status='unpaid'`)
 	if err != nil {
 		return err
@@ -141,7 +147,7 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 		}
 		q, err := tx.Query(ctx, `SELECT tb_transfer_id::text, debit_account::text, credit_account::text, amount_minor, reference,
 			(SELECT count(*) FROM transfer_intent s WHERE s.settles=t.tb_transfer_id),
-			EXISTS (SELECT 1 FROM transfer_intent s WHERE s.settles=t.tb_transfer_id AND s.status IN ('pending','committed'))
+			EXISTS (SELECT 1 FROM transfer_intent s WHERE s.settles=t.tb_transfer_id AND s.status='pending')
 			FROM transfer_intent t
 			WHERE org_id=$1 AND status='unpaid' ORDER BY created_at FOR UPDATE`, org)
 		if err != nil {
@@ -166,7 +172,7 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 			}
 			avail -= u.amt
 			if u.inFlight {
-				continue // a settlement for this intent is already queued or posted; never queue a second one
+				continue // queued but not yet posted: its amount stays reserved above; never queue a second one
 			}
 			sid := ids.U128("arrears", u.id, itoa(u.attempts))
 			if _, err := tx.Exec(ctx, `INSERT INTO transfer_intent(tb_transfer_id,kind,org_id,debit_account,credit_account,amount_minor,currency,reference,settles)
@@ -183,8 +189,7 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 	if _, err := r.A.Ledger.Relay(ctx, 8000); err != nil {
 		return err
 	}
-	if _, err := pool.Exec(ctx, `UPDATE transfer_intent o SET status='settled', updated_at=now() FROM transfer_intent s
-		WHERE s.settles=o.tb_transfer_id AND s.status='committed' AND o.status='unpaid'`); err != nil {
+	if err := markSettled(ctx, pool); err != nil {
 		return err
 	}
 	rows, err = pool.Query(ctx, `SELECT id::text FROM organization o WHERE suspended_at IS NOT NULL
@@ -203,6 +208,12 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 		r.start(ctx, "resume-"+org+"-"+time.Now().UTC().Format("20060102T15"), ResumeOrg, org)
 	}
 	return nil
+}
+
+func markSettled(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `UPDATE transfer_intent o SET status='settled', updated_at=now() FROM transfer_intent s
+		WHERE s.settles=o.tb_transfer_id AND s.status='committed' AND o.status='unpaid'`)
+	return err
 }
 
 func (r *Rater) start(ctx context.Context, id string, wf any, arg string) {

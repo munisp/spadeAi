@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -72,17 +73,29 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	s := &api.Server{Pool: pool, Auth: verifier, Authz: az, Ledger: led, Caps: caps, WF: workflows.Starter{C: tc},
 		InternalSecret: secret, Log: log}
+	// Bind both listeners before serving: if either port is unavailable the process fails instead of
+	// running a public API whose payment-credit hook is unreachable.
 	internal := &http.Server{Addr: config.Get("SPADE_INTERNAL_LISTEN", "127.0.0.1:8081"), Handler: s.InternalRouter(), ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		log.Info("spade-api internal listener", "addr", internal.Addr)
-		if err := internal.ListenAndServe(); err != http.ErrServerClosed {
-			log.Error("internal listener", "err", err)
-		}
-	}()
+	internalLn, err := net.Listen("tcp", internal.Addr)
+	if err != nil {
+		return fmt.Errorf("internal listener %s: %w", internal.Addr, err)
+	}
 	srv := &http.Server{Addr: config.Get("LISTEN", ":8080"), Handler: s.Router(), ReadHeaderTimeout: 10 * time.Second}
+	publicLn, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		internalLn.Close()
+		return fmt.Errorf("public listener %s: %w", srv.Addr, err)
+	}
+	errc := make(chan error, 2)
+	go func() { errc <- internal.Serve(internalLn) }()
+	go func() { errc <- srv.Serve(publicLn) }()
 	go func() { <-ctx.Done(); srv.Shutdown(context.Background()); internal.Shutdown(context.Background()) }()
-	log.Info("spade-api listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+	log.Info("spade-api listening", "addr", srv.Addr, "internal_addr", internal.Addr)
+	// Either listener stopping takes the whole process down so the two are never out of step.
+	err = <-errc
+	srv.Shutdown(context.Background())
+	internal.Shutdown(context.Background())
+	if err != http.ErrServerClosed {
 		return err
 	}
 	return nil

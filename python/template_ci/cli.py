@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -51,6 +52,7 @@ def validate(t: Template) -> list[str]:
     except yaml.YAMLError as e:  # pragma: no cover - message passthrough
         return errs + [f"compose is not YAML: {e}"]
     services = (compose or {}).get("services") or {}
+    declared = set(((compose or {}).get("volumes") or {}).keys())
     if not services:
         errs.append("compose defines no services")
     for name, svc in services.items():
@@ -72,7 +74,7 @@ def validate(t: Template) -> list[str]:
             if "unconfined" in str(opt) or "disable" in str(opt):
                 errs.append(f"service {name}: security_opt {opt} is not allowed")
         for v in svc.get("volumes", []) or []:
-            errs += [f"service {name}: {e}" for e in _volume_errors(v)]
+            errs += [f"service {name}: {e}" for e in _volume_errors(v, declared)]
     for vname, vol in ((compose or {}).get("volumes") or {}).items():
         if isinstance(vol, dict) and (vol.get("driver_opts") or vol.get("external") or vol.get("driver") not in (None, "local")):
             errs.append(f"volume {vname}: only plain named volumes are allowed")
@@ -81,16 +83,21 @@ def validate(t: Template) -> list[str]:
     return errs
 
 
-def _volume_errors(v) -> list[str]:
-    """Only named volumes: no host bind mounts (which would expose the host, e.g. the Docker socket)."""
+_VOLUME_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
+
+
+def _volume_errors(v, declared: set[str]) -> list[str]:
+    """Only anonymous volumes or named volumes declared at top level; anything else may be a host path."""
     if isinstance(v, dict):
         if v.get("type", "volume") != "volume":
             return [f"volume mount type {v.get('type')} is not allowed (named volumes only)"]
-        src = str(v.get("source", ""))
+        src = str(v.get("source") or "")
     else:
         src = str(v).split(":", 1)[0] if ":" in str(v) else ""
-    if src.startswith(("/", ".", "~", "$")) or "docker.sock" in str(v):
-        return [f"host bind mount {v} is not allowed (named volumes only)"]
+    if src == "":
+        return []  # anonymous volume
+    if not _VOLUME_NAME.fullmatch(src) or src not in declared:
+        return [f"host bind mount {v} is not allowed (only named volumes declared under top-level volumes:)"]
     return []
 
 
@@ -147,8 +154,12 @@ def publish(t: Template, dsn: str, report: dict | None) -> None:
                  compose_sha256=EXCLUDED.compose_sha256,
                  -- a publish without a passing smoke test keeps the previous result only if the bundle is unchanged
                  tested_at=CASE WHEN EXCLUDED.tested_at IS NOT NULL THEN EXCLUDED.tested_at
-                   WHEN template_version.compose_sha256=EXCLUDED.compose_sha256 AND %s THEN template_version.tested_at END,
-                 test_report=CASE WHEN EXCLUDED.tested_at IS NOT NULL OR template_version.compose_sha256<>EXCLUDED.compose_sha256 OR NOT %s
+                   WHEN template_version.compose_sha256=EXCLUDED.compose_sha256 AND template_version.manifest=EXCLUDED.manifest
+                     AND template_version.min_vcpu=EXCLUDED.min_vcpu AND template_version.min_ram_mb=EXCLUDED.min_ram_mb AND %s
+                   THEN template_version.tested_at END,
+                 test_report=CASE WHEN EXCLUDED.tested_at IS NOT NULL OR template_version.compose_sha256<>EXCLUDED.compose_sha256
+                     OR template_version.manifest<>EXCLUDED.manifest OR template_version.min_vcpu<>EXCLUDED.min_vcpu
+                     OR template_version.min_ram_mb<>EXCLUDED.min_ram_mb OR NOT %s
                    THEN EXCLUDED.test_report ELSE template_version.test_report END""",
             (tid, str(m["version"]), json.dumps(m), t.compose, t.sha256, m.get("min_vcpu", 1), m.get("min_ram_mb", 1024),
              tested, json.dumps(report or {"skipped": True}), report is None, report is None),
