@@ -136,18 +136,28 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 	}
 	rows.Close()
 	for _, org := range orgs {
-		bal, err := r.A.Ledger.WalletBalance(org, "NGN")
-		if err != nil {
-			return err
-		}
-		avail := bal.Available
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
 		}
+		// Serialise settlement per org across workers; reconcile and read the balance under the lock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7426002, hashtext($1))`, org); err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if _, err := tx.Exec(ctx, markSettledSQL+` AND o.org_id=$1`, org); err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		bal, err := r.A.Ledger.WalletBalance(org, "NGN")
+		if err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		avail := bal.Available
 		q, err := tx.Query(ctx, `SELECT tb_transfer_id::text, debit_account::text, credit_account::text, amount_minor, reference,
 			(SELECT count(*) FROM transfer_intent s WHERE s.settles=t.tb_transfer_id),
-			EXISTS (SELECT 1 FROM transfer_intent s WHERE s.settles=t.tb_transfer_id AND s.status='pending')
+			coalesce((SELECT s.status FROM transfer_intent s WHERE s.settles=t.tb_transfer_id AND s.status IN ('pending','committed') LIMIT 1), '')
 			FROM transfer_intent t
 			WHERE org_id=$1 AND status='unpaid' ORDER BY created_at FOR UPDATE`, org)
 		if err != nil {
@@ -157,22 +167,27 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 		type unpaid struct {
 			id, dr, cr, ref string
 			amt, attempts   int64
-			inFlight        bool
+			live            string // status of this intent's live settlement, if any
 		}
 		var us []unpaid
 		for q.Next() {
 			var u unpaid
-			_ = q.Scan(&u.id, &u.dr, &u.cr, &u.amt, &u.ref, &u.attempts, &u.inFlight)
+			_ = q.Scan(&u.id, &u.dr, &u.cr, &u.amt, &u.ref, &u.attempts, &u.live)
 			us = append(us, u)
 		}
 		q.Close()
 		for _, u := range us {
+			if u.live == "committed" {
+				// Posted by a concurrent relay after reconciliation: already paid, the next pass marks it
+				// settled. Never queue another debit (the unique index enforces this too).
+				continue
+			}
 			if u.amt > avail {
 				break // strictly oldest first
 			}
 			avail -= u.amt
-			if u.inFlight {
-				continue // queued but not yet posted: its amount stays reserved above; never queue a second one
+			if u.live == "pending" {
+				continue // queued but not yet posted: its amount stays reserved above
 			}
 			sid := ids.U128("arrears", u.id, itoa(u.attempts))
 			if _, err := tx.Exec(ctx, `INSERT INTO transfer_intent(tb_transfer_id,kind,org_id,debit_account,credit_account,amount_minor,currency,reference,settles)
@@ -210,9 +225,11 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 	return nil
 }
 
+const markSettledSQL = `UPDATE transfer_intent o SET status='settled', updated_at=now() FROM transfer_intent s
+	WHERE s.settles=o.tb_transfer_id AND s.status='committed' AND o.status='unpaid'`
+
 func markSettled(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `UPDATE transfer_intent o SET status='settled', updated_at=now() FROM transfer_intent s
-		WHERE s.settles=o.tb_transfer_id AND s.status='committed' AND o.status='unpaid'`)
+	_, err := pool.Exec(ctx, markSettledSQL)
 	return err
 }
 
