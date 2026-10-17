@@ -66,19 +66,49 @@ async fn main() -> Result<()> {
     loop {
         let now = Utc::now();
         let current = now.duration_trunc(Duration::hours(1))?;
-        // Meter only closed hours; look back 6h to recover from downtime (idempotent).
-        for back in (1..=6).rev() {
-            let hour = current - Duration::hours(back);
-            let n = meter_hour(&db, hour, now).await?;
-            if n > 0 {
-                println!("{{\"metered_hour\":\"{hour}\",\"readings\":{n}}}");
-            }
+        let n = catch_up(&db, current, now).await?;
+        if n > 0 {
+            println!("{{\"metered_readings\":{n}}}");
         }
         if once {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     }
+}
+
+/// Hours to meter: every closed hour after the cursor, up to `MAX_HOURS_PER_PASS` per pass.
+/// Without a cursor, start at the earliest billable interval so no history is skipped.
+pub fn pending_hours(cursor: Option<DateTime<Utc>>, earliest: Option<DateTime<Utc>>, current: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let first = match (cursor, earliest) {
+        (Some(c), _) => c + Duration::hours(1),
+        (None, Some(e)) => e.duration_trunc(Duration::hours(1)).unwrap_or(e),
+        (None, None) => return vec![],
+    };
+    let mut out = vec![];
+    let mut h = first;
+    while h < current && out.len() < MAX_HOURS_PER_PASS {
+        out.push(h);
+        h += Duration::hours(1);
+    }
+    out
+}
+
+const MAX_HOURS_PER_PASS: usize = 24 * 31;
+
+async fn catch_up(db: &Client, current: DateTime<Utc>, now: DateTime<Utc>) -> Result<u64> {
+    let cursor: Option<DateTime<Utc>> = db.query_opt("SELECT last_hour FROM metering_cursor", &[]).await?.map(|r| r.get(0));
+    let earliest: Option<DateTime<Utc>> = db.query_one("SELECT min(started_at) FROM service_state_interval", &[]).await?.get(0);
+    let mut n = 0;
+    for hour in pending_hours(cursor, earliest, current) {
+        n += meter_hour(db, hour, now).await?;
+        db.execute(
+            "INSERT INTO metering_cursor(id,last_hour) VALUES (true,$1) ON CONFLICT (id) DO UPDATE SET last_hour=EXCLUDED.last_hour, updated_at=now()",
+            &[&hour],
+        )
+        .await?;
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -93,5 +123,17 @@ mod tests {
         assert_eq!(overlap_milli(h + Duration::minutes(30), None, h, now), 500);
         assert_eq!(overlap_milli(h + Duration::minutes(15), Some(h + Duration::minutes(45)), h, now), 500);
         assert_eq!(overlap_milli(h + Duration::hours(2), None, h, now), 0);
+    }
+    #[test]
+    fn pending_hours_backfills_from_cursor_without_gap() {
+        let cur = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let hrs = pending_hours(Some(cur - Duration::hours(10)), None, cur);
+        assert_eq!(hrs.len(), 9);
+        assert_eq!(hrs[0], cur - Duration::hours(9));
+        assert_eq!(*hrs.last().unwrap(), cur - Duration::hours(1));
+        let first = pending_hours(None, Some(cur - Duration::minutes(150)), cur);
+        assert_eq!(first[0], cur - Duration::hours(3));
+        assert!(pending_hours(None, None, cur).is_empty());
+        assert!(pending_hours(Some(cur - Duration::hours(1)), None, cur).is_empty());
     }
 }

@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 API=${API:-http://localhost:8080}
 GW=${GW:-https://localhost:8443}
-SECRET=${SPADE_INTERNAL_SECRET:-local-dev-internal-secret}
+SECRET=${SPADE_INTERNAL_SECRET:?export the same SPADE_INTERNAL_SECRET (>=32 chars) used by spade-api}
+INTERNAL=${INTERNAL:-http://127.0.0.1:8081}
 DB=${SPADE_DATABASE_URL:-postgres://spade:spade-local-dev@127.0.0.1:5433/spadeai}
 j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(eval(sys.argv[1]))" "$1"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -15,12 +16,13 @@ TOKEN=$(curl -sf -d client_id=spade-cli -d grant_type=password -d username=dev@s
   http://localhost:8180/realms/spadeai/protocol/openid-connect/token | j "d['access_token']")
 H=(-H "Authorization: Bearer $TOKEN")
 topup() { local body="{\"org_id\":\"$1\",\"provider\":\"paystack\",\"provider_ref\":\"$2\",\"amount_minor\":$3}"
-  curl -sf -H "X-Spade-Signature: $(printf %s "$body" | openssl dgst -sha256 -hmac "$SECRET" | cut -d' ' -f2)" -d "$body" "$API/internal/payments/verified" >/dev/null; }
+  curl -sf -H "X-Spade-Signature: $(printf %s "$body" | openssl dgst -sha256 -hmac "$SECRET" | cut -d' ' -f2)" -d "$body" "$INTERNAL/internal/payments/verified" >/dev/null; }
 wallet() { curl -sf "${H[@]}" "$API/v1/orgs/$1/wallet"; }
 
 SPADE_DATABASE_URL=$DB .venv/bin/spade-template-ci --smoke --publish templates/whoami | j "d['smoke']['passed']" | grep -q True || fail "template smoke"
 
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/v1/orgs")" = 401 ] || fail "unauthenticated request not rejected"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/internal/payments/verified")" = 404 ] || fail "payment credit hook exposed on the public listener"
 ORG=$(curl -sf "${H[@]}" -d '{"name":"E2E Ltd","billing_mode":"prepaid"}' "$API/v1/orgs" | j "d['id']")
 RUN=$RANDOM$RANDOM
 topup "$ORG" "e2e-$RUN-1" 5000000

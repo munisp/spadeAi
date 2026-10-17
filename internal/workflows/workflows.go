@@ -117,10 +117,19 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 		"start": {"compose_up", "running"}, "stop": {"compose_down", "stopped"},
 		"restart": {"compose_restart", "running"}, "delete": {"compose_down", "deleted"},
 	}[action][0], map[string]string{"start": "running", "stop": "stopped", "restart": "running", "delete": "deleted"}[action]
+	var prev string
 	if action == "delete" {
+		if err := workflow.ExecuteActivity(sctx, a.GetState, serviceID).Get(ctx, &prev); err != nil {
+			_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
+			return err
+		}
 		_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, "deleting", "").Get(ctx, nil)
 	}
 	if err := runCommand(ctx, a, serviceID, verb); err != nil {
+		if action == "delete" {
+			// Containers may still be running: restore the previous (possibly billable) state.
+			_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, prev, "delete failed: "+err.Error()).Get(ctx, nil)
+		}
 		_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
 		return err
 	}

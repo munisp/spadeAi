@@ -140,7 +140,9 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 			return err
 		}
 		q, err := tx.Query(ctx, `SELECT tb_transfer_id::text, debit_account::text, credit_account::text, amount_minor, reference,
-			(SELECT count(*) FROM transfer_intent s WHERE s.settles=t.tb_transfer_id) FROM transfer_intent t
+			(SELECT count(*) FROM transfer_intent s WHERE s.settles=t.tb_transfer_id),
+			EXISTS (SELECT 1 FROM transfer_intent s WHERE s.settles=t.tb_transfer_id AND s.status IN ('pending','committed'))
+			FROM transfer_intent t
 			WHERE org_id=$1 AND status='unpaid' ORDER BY created_at FOR UPDATE`, org)
 		if err != nil {
 			tx.Rollback(ctx)
@@ -149,11 +151,12 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 		type unpaid struct {
 			id, dr, cr, ref string
 			amt, attempts   int64
+			inFlight        bool
 		}
 		var us []unpaid
 		for q.Next() {
 			var u unpaid
-			_ = q.Scan(&u.id, &u.dr, &u.cr, &u.amt, &u.ref, &u.attempts)
+			_ = q.Scan(&u.id, &u.dr, &u.cr, &u.amt, &u.ref, &u.attempts, &u.inFlight)
 			us = append(us, u)
 		}
 		q.Close()
@@ -162,6 +165,9 @@ func (r *Rater) settleArrears(ctx context.Context) error {
 				break // strictly oldest first
 			}
 			avail -= u.amt
+			if u.inFlight {
+				continue // a settlement for this intent is already queued or posted; never queue a second one
+			}
 			sid := ids.U128("arrears", u.id, itoa(u.attempts))
 			if _, err := tx.Exec(ctx, `INSERT INTO transfer_intent(tb_transfer_id,kind,org_id,debit_account,credit_account,amount_minor,currency,reference,settles)
 				VALUES ($1::text::numeric,'arrears_settlement',$2,$3::text::numeric,$4::text::numeric,$5,'NGN',$6,$7::text::numeric) ON CONFLICT DO NOTHING`,

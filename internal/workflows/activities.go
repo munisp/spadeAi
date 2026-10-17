@@ -45,6 +45,12 @@ func (a *Activities) MarkOperation(ctx context.Context, opID, status, workflowID
 
 var billable = map[string]bool{"running": true, "stopped": true, "maintenance": true, "updating": true, "resizing": true, "restoring": true}
 
+func (a *Activities) GetState(ctx context.Context, serviceID string) (string, error) {
+	var st string
+	err := a.Pool.QueryRow(ctx, `SELECT state FROM service WHERE id=$1`, serviceID).Scan(&st)
+	return st, err
+}
+
 // SetState moves a service to a new state and keeps service_state_interval (the metering source) consistent.
 func (a *Activities) SetState(ctx context.Context, serviceID, state, reason string) error {
 	tx, err := a.Pool.Begin(ctx)
