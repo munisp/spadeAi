@@ -382,25 +382,35 @@ async fn backup_run(p: &Value, dir: &Path, project: &str) -> Result<Value> {
     }
     let mut paths = project_volumes(project).await?;
     paths.push(path_str(dir)?.to_string());
-    // Only stop/start containers that are actually running, so backing up a stopped service never starts it.
-    let running = !run_tool(
+    // Quiesce only the containers running now and restart exactly those, so a backup never changes
+    // which containers run (stopped or partially stopped services stay that way).
+    let ids: Vec<String> = run_tool(
         "docker",
         &["compose", "-p", project, "ps", "-q", "--status", "running"],
         None,
     )
     .await?
-    .trim()
-    .is_empty();
-    let quiesce = p["quiesce"].as_bool().unwrap_or(true) && running;
+    .split_whitespace()
+    .map(String::from)
+    .collect();
+    let quiesce = p["quiesce"].as_bool().unwrap_or(true) && !ids.is_empty();
+    let with_ids = |verb: &'static str| {
+        let mut a = vec![verb];
+        a.extend(ids.iter().map(String::as_str));
+        a
+    };
     if quiesce {
-        compose(dir, project, &["stop"]).await?;
+        if let Err(e) = run_tool("docker", &with_ids("stop"), None).await {
+            let _ = run_tool("docker", &with_ids("start"), None).await;
+            return Err(e);
+        }
     }
     let mut args = vec!["backup", "--json", "--tag", "spade", "--tag", project];
     args.extend(paths.iter().map(String::as_str));
     let res = restic(&env, &args).await;
     if quiesce {
         // Always restart the app, even when the backup failed.
-        compose(dir, project, &["start"]).await?;
+        run_tool("docker", &with_ids("start"), None).await?;
     }
     let out = res?;
     let summary: Value = out
@@ -470,11 +480,31 @@ async fn backup_restore(p: &Value, dir: &Path, project: &str) -> Result<Value> {
         let _ = std::fs::remove_dir_all(&stage);
         return Err(unchanged(e));
     }
-    compose(dir, project, &["stop"]).await.map_err(unchanged)?;
+    // A failed stop may have stopped some containers, so it is not reported as "data unchanged".
+    if let Err(e) = compose(dir, project, &["stop"]).await {
+        let _ = std::fs::remove_dir_all(&stage);
+        bail!("restore aborted while stopping the app (volumes untouched, containers may be stopped): {e:#}");
+    }
     let swap = async {
         for x in &paths {
             let staged = format!("{stage}{x}");
-            if *x != stack {
+            if *x == stack {
+                // Replace the stack dir wholesale (files added since the snapshot must not survive),
+                // keeping the live copy until the staged one is fully in place.
+                if Path::new(&staged).exists() {
+                    let prev = format!("{stack}.prev");
+                    let _ = std::fs::remove_dir_all(&prev);
+                    std::fs::rename(&stack, &prev)?;
+                    if let Err(e) = run_tool("cp", &["-a", &staged, &stack], None).await {
+                        let _ = std::fs::remove_dir_all(&stack);
+                        std::fs::rename(&prev, &stack)?;
+                        return Err(e);
+                    }
+                    std::fs::remove_dir_all(&prev)?;
+                }
+                continue;
+            }
+            {
                 // Empty volumes first so files created after the snapshot do not survive.
                 for e in std::fs::read_dir(x)?.flatten() {
                     let path = e.path();
