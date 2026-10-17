@@ -28,6 +28,8 @@ type Server struct {
 	// KEK and BackupRepo let the gateway inject backup credentials at delivery; nil/empty fails closed.
 	KEK        *secrets.KEK
 	BackupRepo string
+	// AllowPlaintextBackupRepo permits credentials in a rest:http:// repository URL (local dev only).
+	AllowPlaintextBackupRepo bool
 }
 
 type agentKey struct{}
@@ -252,6 +254,9 @@ func (s *Server) injectSecrets(ctx context.Context, payload []byte) ([]byte, err
 	svc, _ := ref["service_id"].(string)
 	if ref["kind"] != "backup" || svc == "" {
 		return nil, fmt.Errorf("unsupported secret_ref")
+	}
+	if strings.HasPrefix(s.BackupRepo, "rest:http://") && strings.Contains(s.BackupRepo, "@") && !s.AllowPlaintextBackupRepo {
+		return nil, fmt.Errorf("backups unavailable: SPADE_BACKUP_REPO would send repository credentials over plain HTTP; use rest:https:// (SPADE_BACKUP_ALLOW_PLAINTEXT=1 is for local dev only)")
 	}
 	if s.KEK == nil || s.BackupRepo == "" {
 		return nil, fmt.Errorf("backups unavailable: KEK or SPADE_BACKUP_REPO not configured on the gateway")
