@@ -24,6 +24,7 @@ import (
 	"github.com/munisp/spadeai/internal/backups"
 	"github.com/munisp/spadeai/internal/capability"
 	"github.com/munisp/spadeai/internal/config"
+	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
 	"github.com/munisp/spadeai/internal/workflows"
 )
@@ -87,7 +88,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 		secret = ""
 	}
 	s := &api.Server{Pool: pool, Auth: verifier, Authz: az, Ledger: led, Caps: caps, WF: workflows.Starter{C: tc},
-		InternalSecret: secret, Log: log}
+		InternalSecret: secret, Log: log, GatewayURL: config.Get("GATEWAY_PUBLIC_URL", "https://localhost:8443")}
+	if ca, err := gateway.LoadOrCreateCA(config.CADir()); err == nil {
+		s.CAPin = ca.Pin()
+	} else {
+		log.Error("agent CA unavailable; adding Kubernetes clusters is disabled", "err", err)
+	}
+	apiSrv := s
+	caps.Register("provider.kubernetes", func(ctx context.Context) (string, string) {
+		if apiSrv.CAPin == "" {
+			return "unavailable", "agent CA unavailable, clusters cannot be added"
+		}
+		var online int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent a JOIN k8s_cluster c ON c.id=a.cluster_id
+			WHERE c.deleted_at IS NULL AND a.last_seen_at > now() - interval '2 minutes'`).Scan(&online); err != nil {
+			return "degraded", err.Error()
+		}
+		return "available", fmt.Sprintf("Helm-installed outbound agent; %d cluster agents online. Backups of Kubernetes services are not implemented", online)
+	})
+	caps.Register("backups.kubernetes", func(context.Context) (string, string) {
+		return "unavailable", "no PVC snapshot/Velero integration yet; backup requests for Kubernetes services are refused"
+	})
 	// Bind both listeners before serving: if either port is unavailable the process fails instead of
 	// running a public API whose payment-credit hook is unreachable.
 	internal := &http.Server{Addr: config.Get("SPADE_INTERNAL_LISTEN", "127.0.0.1:8081"), Handler: s.InternalRouter(), ReadHeaderTimeout: 10 * time.Second}

@@ -1,0 +1,53 @@
+{{- if ne .Release.Namespace "spade-system" }}{{ fail "install spade-agent in the spade-system namespace (service NetworkPolicies admit health probes from there)" }}{{ end }}
+{{- if not (hasPrefix "https://" .Values.gateway) }}{{ fail "gateway must be an https:// URL" }}{{ end }}
+{{- if not (regexMatch "^[0-9a-fA-F]{64}$" .Values.caSha256) }}{{ fail "caSha256 must be a 64-character hex SHA-256" }}{{ end }}
+{{- if .Values.enrolToken }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spade-agent-enrol
+  namespace: {{ .Release.Namespace }}
+type: Opaque
+stringData:
+  token: {{ .Values.enrolToken | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spade-agent
+  namespace: {{ .Release.Namespace }}
+  labels: {app.kubernetes.io/name: spade-agent}
+spec:
+  replicas: 1   # one agent per cluster; a second would race for commands
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: spade-agent}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: spade-agent}
+      annotations:
+        # a new enrolment token (cluster re-registered) rolls the pod so the agent re-enrols
+        spade.ai/enrol-token-sha256: {{ .Values.enrolToken | sha256sum | quote }}
+    spec:
+      serviceAccountName: spade-agent
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [run-k8s, --gateway, {{ .Values.gateway | quote }}, --secret, {{ .Values.identitySecret | quote }}]
+          env:
+            - {name: SPADE_CA_SHA256, value: {{ .Values.caSha256 | quote }}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: SPADE_ENROL_TOKEN
+              valueFrom: {secretKeyRef: {name: spade-agent-enrol, key: token, optional: true}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/spade}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: state, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}

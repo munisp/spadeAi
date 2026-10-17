@@ -1,0 +1,13 @@
+# In-cluster SpadeAi agent image. Build the static agent first:
+#   cargo build --release --target x86_64-unknown-linux-musl -p spade-agent   (in rust/)
+#   docker build -f rust/agent/Dockerfile.k8s -t spade-agent-k8s:dev rust/
+FROM alpine:3.20
+ARG KUBECTL_VERSION=v1.31.4
+ARG KUBECTL_SHA256=298e19e9c6c17199011404278f0ff8168a7eca4217edad9097af577023a5620f
+RUN apk add --no-cache ca-certificates curl \
+ && curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl \
+ && echo "${KUBECTL_SHA256}  /usr/local/bin/kubectl" | sha256sum -c - \
+ && chmod 0755 /usr/local/bin/kubectl && apk del curl
+COPY target/x86_64-unknown-linux-musl/release/spade-agent /usr/local/bin/spade-agent
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/spade-agent"]

@@ -23,7 +23,7 @@ pub fn overlap_milli(
 async fn meter_hour(db: &Client, hour: DateTime<Utc>, now: DateTime<Utc>) -> Result<u64> {
     let rows = db
         .query(
-            "SELECT i.service_id::text, i.started_at, i.ended_at, z.vcpu, z.ram_mb, z.disk_gb, s.support_plan
+            "SELECT i.service_id::text, i.started_at, i.ended_at, z.vcpu * i.replicas, z.ram_mb * i.replicas, z.disk_gb * i.replicas, s.support_plan
              FROM service_state_interval i JOIN service s ON s.id=i.service_id JOIN size z ON z.id=s.size_id
              WHERE i.started_at < $1 AND (i.ended_at IS NULL OR i.ended_at > $2)",
             &[&(hour + Duration::hours(1)), &hour],

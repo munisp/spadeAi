@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/munisp/spadeai/internal/kube"
 	"io"
 	"log/slog"
 	"net/http"
@@ -44,7 +45,10 @@ type Server struct {
 	Caps           *capability.Registry
 	WF             Workflows
 	InternalSecret string // HMAC key shared with the payments service; empty disables the hook
-	Log            *slog.Logger
+	// GatewayURL / CAPin go into the Helm command shown when a Kubernetes cluster is added.
+	GatewayURL string
+	CAPin      string
+	Log        *slog.Logger
 }
 
 type ctxKey struct{}
@@ -75,6 +79,10 @@ func (s *Server) Router() http.Handler {
 		r.Get("/v1/projects/{project}/services", s.listServices)
 		r.Get("/v1/projects/{project}/overlay", s.getOverlay)
 		r.Post("/v1/projects/{project}/services", s.createService)
+		r.Post("/v1/projects/{project}/clusters", s.createCluster)
+		r.Get("/v1/projects/{project}/clusters", s.listClusters)
+		r.Post("/v1/clusters/{cluster}/refresh", s.refreshCluster)
+		r.Get("/v1/clusters/{cluster}/options", s.clusterOptions)
 		r.Get("/v1/services/{service}", s.getService)
 		r.Post("/v1/services/{service}/actions/{action}", s.serviceAction)
 		r.Get("/v1/services/{service}/backups", s.listBackups)
@@ -467,6 +475,7 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		Size        string            `json:"size"`
 		SupportPlan string            `json:"support_plan"`
 		Env         map[string]string `json:"env"`
+		Kubernetes  *KubeSpec         `json:"kubernetes"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
 		writeErr(w, 400, "bad_json", err.Error())
@@ -508,11 +517,23 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		if !sizeOK {
 			return fmt.Errorf("size %q is not offered by provider %q", in.Size, in.Provider)
 		}
+		var kubeCluster, kubeCfg any
+		replicas := 1
+		if in.Provider == "kubernetes" {
+			var cfg []byte
+			var err error
+			if inNigeria, cfg, err = prepareKube(r.Context(), tx, p, tvID, in.Size, in.Kubernetes, in.Env); err != nil {
+				return err
+			}
+			kubeCluster, kubeCfg, replicas = in.Kubernetes.ClusterID, cfg, in.Kubernetes.Replicas
+		} else if in.Kubernetes != nil {
+			return fmt.Errorf("the kubernetes block needs a kubernetes:* size")
+		}
 		if locked && !inNigeria {
 			return fmt.Errorf("residency-locked organizations cannot deploy to %s (no Nigerian region)", in.Provider)
 		}
-		if err := tx.QueryRow(r.Context(), `INSERT INTO service(project_id, template_version_id, display_name, provider_id, size_id, support_plan, env)
-			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id::text`, p, tvID, in.DisplayName, in.Provider, in.Size, in.SupportPlan, envJSON).Scan(&svcID); err != nil {
+		if err := tx.QueryRow(r.Context(), `INSERT INTO service(project_id, template_version_id, display_name, provider_id, size_id, support_plan, env, replicas, k8s_cluster_id, k8s_config)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::uuid,$10) RETURNING id::text`, p, tvID, in.DisplayName, in.Provider, in.Size, in.SupportPlan, envJSON, replicas, kubeCluster, kubeCfg).Scan(&svcID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(r.Context(), `UPDATE operation SET target_id=$2 WHERE id=$1`, opID, svcID); err != nil {
@@ -548,21 +569,38 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	id, action := chi.URLParam(r, "service"), chi.URLParam(r, "action")
-	perm := map[string]string{"start": "operate", "stop": "operate", "restart": "operate", "delete": "destroy"}[action]
+	perm := map[string]string{"start": "operate", "stop": "operate", "restart": "operate", "delete": "destroy", "scale": "operate"}[action]
 	key := r.Header.Get("Idempotency-Key")
-	if !require(w, perm != "", "action must be start, stop, restart or delete") || !require(w, key != "", "Idempotency-Key header is required") || !s.allow(w, r, "service", id, perm) {
+	var scale struct {
+		Replicas int `json:"replicas"`
+	}
+	if action == "scale" {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&scale)
+		if !require(w, scale.Replicas >= 1 && scale.Replicas <= kube.MaxReplicas, fmt.Sprintf("scale needs {\"replicas\": 1..%d}", kube.MaxReplicas)) {
+			return
+		}
+	}
+	reqID := id
+	if action == "scale" {
+		reqID = fmt.Sprintf("%s:%d", id, scale.Replicas)
+	}
+	if !require(w, perm != "", "action must be start, stop, restart, scale or delete") || !require(w, key != "", "Idempotency-Key header is required") || !s.allow(w, r, "service", id, perm) {
 		return
 	}
 	var opID string
 	var existing bool
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
 		var err error
-		if opID, existing, err = s.startOperation(r.Context(), tx, key, "service."+action, "service", []byte(id)); err != nil || existing {
+		if opID, existing, err = s.startOperation(r.Context(), tx, key, "service."+action, "service", []byte(reqID)); err != nil || existing {
 			return err
 		}
 		var protected bool
-		if err := tx.QueryRow(r.Context(), `SELECT termination_protected FROM service WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&protected); err != nil {
+		var provider, state string
+		if err := tx.QueryRow(r.Context(), `SELECT termination_protected, provider_id, state FROM service WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&protected, &provider, &state); err != nil {
 			return fmt.Errorf("service not found")
+		}
+		if action == "scale" && (provider != "kubernetes" || state != "running") {
+			return fmt.Errorf("scale applies to running Kubernetes services; VM services change size instead")
 		}
 		if action == "delete" && protected {
 			return fmt.Errorf("service is termination-protected")
@@ -583,7 +621,11 @@ func (s *Server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		s.writeOperation(w, r, opID, 200)
 		return
 	}
-	if _, err := s.WF.StartAction(r.Context(), opID, id, action); err != nil {
+	wfAction := action
+	if action == "scale" {
+		wfAction = fmt.Sprintf("scale:%d", scale.Replicas)
+	}
+	if _, err := s.WF.StartAction(r.Context(), opID, id, wfAction); err != nil {
 		s.failOperation(r.Context(), opID, "workflow start failed: "+err.Error())
 		writeErr(w, 503, "workflows_unavailable", err.Error())
 		return
