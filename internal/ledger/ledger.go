@@ -198,6 +198,10 @@ func (l *Ledger) Relay(ctx context.Context, limit int) (*RelayResult, error) {
 			status = "committed"
 			out.Committed++
 		case tb.TransferExceedsCredits:
+			if b.kind != "usage" && b.kind != "vat" {
+				out.Failed++
+				break
+			}
 			status = "unpaid"
 			if !seenUnpaid[b.org] {
 				seenUnpaid[b.org] = true

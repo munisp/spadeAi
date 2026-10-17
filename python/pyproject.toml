@@ -1,0 +1,17 @@
+[project]
+name = "spade-python"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2", "PyYAML>=6.0", "httpx>=0.27", "fastapi>=0.115", "uvicorn>=0.30"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+spade-template-ci = "template_ci.cli:main"
+
+[tool.setuptools]
+packages = ["template_ci", "ai_devops"]
+
+[tool.ruff]
+line-length = 120

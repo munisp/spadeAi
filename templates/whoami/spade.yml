@@ -1,0 +1,12 @@
+slug: whoami
+name: Whoami
+category: developer-tools
+licence_spdx: MIT
+description: Tiny HTTP echo service used for agent and pipeline smoke tests.
+version: "1.10.3"
+min_vcpu: 1
+min_ram_mb: 256
+health:
+  port: 18080
+  path: /
+  expect_status: [200]

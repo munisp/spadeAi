@@ -1,0 +1,9 @@
+.spade/
+dist/
+bin/
+.venv/
+__pycache__/
+*.egg-info/
+node_modules/
+target/
+.expo/

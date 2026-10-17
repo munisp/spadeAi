@@ -135,3 +135,8 @@ func (c *Client) Healthy(ctx context.Context) error {
 	}
 	return nil
 }
+
+// T builds a relationship tuple: entity#relation@subject.
+func T(entityType, entityID, relation, subjectType, subjectID string) Tuple {
+	return Tuple{EntityType: entityType, EntityID: entityID, Relation: relation, SubjectType: subjectType, SubjectID: subjectID}
+}
