@@ -139,7 +139,7 @@ sequenceDiagram
   G->>V: typed command
   V-->>G: compose up OK + health probe OK
   T->>G: ConfigureTLS / Firewall / Backup policy
-  T->>L: release hold, start hourly metering
+  T->>L: void hold (funds check only), start hourly metering
   T-->>A: op succeeded (service=running)
   A-->>C: SSE/push: running + credential reveal link (one-time)
 ```
@@ -152,7 +152,7 @@ flowchart LR
   J --> B{"Wallet balance"}
   B -- "≥ threshold" --> OK[continue]
   B -- "< low-water" --> AR["Auto-refill via Paystack/Flutterwave/Stripe"]
-  B -- "≤ 0 (prepaid)" --> S["Temporal SuspendProject:<br/>notify → stop stacks → grace N days → final backup → delete (restorable 14d)"]
+  B -- "≤ 0, or debit rejected exceeds_credits (prepaid)" --> S["Temporal SuspendProject:<br/>record arrears → notify → stop stacks → grace N days → final backup → delete (restorable 14d)"]
   PP["Postpaid org"] --> INV["Monthly invoice + credit limit + dunning"]
 ```
 

@@ -71,7 +71,7 @@ running ⇄ stopped | updating | resizing | restoring | maintenance
 running → suspended (billing) → deleting → deleted (restorable 14d) → purged
 any → failed (with compensations; never reported as running)
 ```
-- **DeployService:** reserve funds (TigerBeetle pending transfer) → provider driver `CreateVM` → wait for agent enrolment (mTLS CSR signed by an internal CA; token is single-use and expires in 15 min) → agent pulls the signed template bundle → `compose up` → health probe → ACME → firewall → initial backup → post pending transfer, start metering. Each step is an activity with retry/timeout; failure triggers compensation (destroy VM, void pending transfer).
+- **DeployService:** reserve funds (TigerBeetle pending transfer) → provider driver `CreateVM` → wait for agent enrolment (mTLS CSR signed by an internal CA; token is single-use and expires in 15 min) → agent pulls the signed template bundle → `compose up` → health probe → ACME → firewall → initial backup → **void** the pending transfer (it is only a funds check, never a prepayment) and start hourly metering. Each step is an activity with retry/timeout; failure triggers compensation (destroy VM, void pending transfer).
 - **UpdateApp:** runs inside the maintenance window. Pre-update snapshot → `preUpdateCommand` → pull new digests → up → health check → `postUpdateCommand`. On failure, automatic rollback to the snapshot (E14).
 - **Backup / Restore:** restic or Borg (E12) to (a) local, (b) remote in-country vault, (c) customer S3. Every restore runs `preRestore`/`postRestore` hooks. A weekly **restore-verification** job restores into a scratch VM and records `verified_at`.
 - **Suspend / Delete:** the billing workflow enforces balance ≥ minimum to start (E8). At zero balance: notify, then suspend (stop the stack, keep the disk), then delete after N days with a final backup kept 14 days.
@@ -123,8 +123,9 @@ any → failed (with compensations; never reported as running)
 - **Metering (Rust):** hourly aggregation from `service` state intervals plus agent counters (bandwidth, storage, requests) into `meter_reading`. Exactly-once is enforced by `(service_id, sku, period_start)` uniqueness.
 - **Rating:** `meter_reading` × `price_item` (version pinned at period start) produces TigerBeetle transfers: debit customer wallet, credit revenue, plus a linked transfer crediting VAT liability.
 - **Transfer IDs:** deterministic, as hash(service, sku, period). Retries are therefore idempotent, and TigerBeetle rejects duplicates with `exists`.
-- **Deploy holds:** placed as TigerBeetle **pending transfers** with a timeout; post or void on completion.
-- **Prepaid wallets:** use the `debits_must_not_exceed_credits` flag. Overdraft is impossible at the ledger level, and an `exceeds_credits` result triggers the suspend workflow.
+- **Deploy holds:** a TigerBeetle **pending transfer** with a timeout, used only as a funds check. It is **voided** on success (before hourly metering starts) and on failure. It is never posted, so the first hours are charged exactly once, by the rating flow.
+- **Prepaid wallets:** use the `debits_must_not_exceed_credits` flag. Overdraft is impossible at the ledger level. When an hourly debit is rejected with `exceeds_credits` (e.g. a ₦3 balance against a ₦5 charge), the wallet does not reach zero, so this rejection itself triggers the suspend workflow.
+- **Arrears:** the rejected reading is kept as an `unpaid` `transfer_intent` (arrears). A later top-up settles arrears first, oldest first and with the same deterministic IDs, before any service can resume. Arrears are written off only through an audited adjustment.
 - **Postpaid accounts:** use a credit-limit control account.
 - **Outbox:** Postgres `transfer_intent` is the outbox. A Go relay submits batches to TigerBeetle (≤ 8,190 per batch) and records the result.
 - **Payments:** Paystack, Flutterwave, Remita, Stripe adapters. Webhooks are verified by HMAC and are idempotent on provider reference. Top-up credits the wallet only on a verified webhook, never on client redirect.
