@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -191,6 +192,11 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 
 // Host dependencies on a stock ubuntu-24.04 image: Docker + Compose for stacks, WireGuard tools and
 // pinned Nebula for overlays, restic for backups.
+var (
+	safeGatewayURL = regexp.MustCompile(`^https://[A-Za-z0-9.\-]+(:[0-9]{1,5})?(/[A-Za-z0-9._\-/]*)?$`)
+	hexOnly        = regexp.MustCompile(`^[0-9a-f]+$`)
+)
+
 var hetznerPackages = []string{"docker.io", "docker-compose-v2", "wireguard-tools", "restic", "curl", "openssl"}
 
 const nebulaInstall = `curl -fsSL -o /tmp/nebula.tgz https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz && ` +
@@ -207,6 +213,10 @@ func (a *Activities) provisionHetzner(ctx context.Context, serviceID, token, att
 	// Reconcile by label on every attempt, whether or not provider_ref was recorded.
 	if err := a.Hetzner.DeleteOthers(ctx, serviceID, attempt); err != nil {
 		return nil, err
+	}
+	// Values are interpolated into a root shell command, so only accept URL/hex characters.
+	if !safeGatewayURL.MatchString(a.GatewayURL) || !hexOnly.MatchString(a.CAPin) || !hexOnly.MatchString(token) {
+		return nil, nonRetryable("GATEWAY_PUBLIC_URL must be https://host[:port][/path] with no quotes or spaces, and the CA pin hex")
 	}
 	run := fmt.Sprintf("SPADE_GATEWAY='%s' SPADE_CA_SHA256='%s' SPADE_ENROL_TOKEN='%s' sh /opt/spade/install.sh", a.GatewayURL, a.CAPin, token)
 	boot := hetzner.Boot{Packages: hetznerPackages, Files: map[string]string{"/opt/spade/install.sh": gateway.InstallScript()},
