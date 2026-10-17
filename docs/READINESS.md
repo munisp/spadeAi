@@ -1,6 +1,6 @@
 # Production readiness
 
-**Overall: about 40/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM, plus per-project private networks (WireGuard and Nebula) between hosts. It is not a production platform yet.
+**Overall: about 45/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM, plus per-project private networks (WireGuard and Nebula) between hosts and encrypted off-host backups with restore. It is not a production platform yet.
 
 ## Verified locally (scripts/e2e.sh plus unit tests)
 | Area | Evidence |
@@ -13,13 +13,13 @@
 | Billing | TigerBeetle pending hold used as a funds check and voided after deploy (no double charge); hourly metering; rating; `exceeds_credits` suspends the org and records arrears; a top-up settles arrears oldest first and resumes the org |
 | Capabilities | `/v1/capabilities` reports every integration; anything unimplemented or unconfigured shows as `unavailable` |
 | Template CI | Lint rules plus a real docker smoke test before a version can be deployed |
+| Backups | `scripts/e2e-backup.sh`: restic snapshot of the service's named volumes and stack dir (quiesced by default) to an off-host REST repository, encrypted with a per-service password sealed by the KEK; restore empties the volumes, restores and restarts, and the data matches the snapshot exactly. The gateway injects repository credentials at delivery, so they are never stored in `agent_command` (checked). Daily schedule per running service; retention via `restic forget --keep-daily` |
 | Private networks | `scripts/e2e-overlay.sh`: two docker-in-docker hosts per kind. WireGuard full mesh and Nebula (lighthouse = lowest IP, per-project CA sealed with the KEK) both reach each other over the overlay; deleting a service removes it and the survivor's mesh shrinks. Host private keys never enter the command queue (checked) |
 
 ## Unavailable or not implemented (reported honestly as `unavailable`)
 | Area | State |
 |---|---|
 | Cloud drivers (Hetzner, AWS, Proxmox, OpenStack) | Not implemented. BYOVM only |
-| Backups (Borg/restic orchestration) | Not implemented |
 | Paystack / Flutterwave | Code and tests done; **no credentials configured**, so these report unavailable. Not yet verified against the live sandbox |
 | AI DevOps | Router and policy enforcement are unit-tested; no LLM backend is configured, so `/healthz` returns 503 |
 | Mobile app | Type-checks only; not run on a device or emulator |
@@ -30,3 +30,4 @@
 | Observability | Structured logs only; no metrics or tracing |
 | Tests | Go unit tests are thin; there are no Go integration tests in CI (e2e needs the full stack) |
 | Overlay at scale | Each apply restarts Nebula only when its config changes; WireGuard uses `wg syncconf` (no tunnel drop). Not yet tested beyond two hosts, across NAT, or with IPv6 endpoints; hosts that are offline during a mesh change converge only on the next change |
+| Backups hardening | Local REST server runs without auth (repositories are still encrypted client-side). Missing: per-tenant repo credentials, append-only/immutable storage, restore into a new service, backup billing, and tests with large volumes or long-running databases (quiesce means brief downtime) |

@@ -68,7 +68,8 @@ export default function App() {
     {wallet && <Text>Available {naira(wallet.balance.available_minor)} · Reserved {naira(wallet.balance.pending_debits_minor)} · Arrears {naira(wallet.arrears_minor)}</Text>}
     <FlatList data={services} keyExtractor={s => s.id} renderItem={({ item }) => <View style={st.card}>
       <Text style={{ fontWeight: "600" }}>{item.display_name} · {item.project}</Text><Text>{item.template} — {item.state}{item.overlay_ip ? ` · private IP ${item.overlay_ip}` : ""}</Text>
-      <View style={{ flexDirection: "row" }}>{["start", "stop", "restart"].map(a => <Button key={a} title={a} onPress={() => act(item, a)} />)}</View>
+      <View style={{ flexDirection: "row" }}>{["start", "stop", "restart"].map(a => <Button key={a} title={a} onPress={() => act(item, a)} />)}
+        <Button title="back up" onPress={() => call(`/v1/services/${item.id}/backups`, { method: "POST", idempotent: true }).then(() => Alert.alert("SpadeAi", "Backup started")).catch(fail)} /></View>
     </View>} />
   </SafeAreaView>;
 }
