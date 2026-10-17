@@ -4,6 +4,7 @@ package workflows
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/client"
@@ -296,7 +297,12 @@ func RestoreService(ctx workflow.Context, opID, serviceID, backupID string) erro
 		msg = werr.Error()
 	}
 	_ = workflow.ExecuteActivity(sctx, a.BackupFinish, rec, cmd, msg).Get(ctx, nil)
-	_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, prev, msg).Get(ctx, nil)
+	final := prev
+	if werr != nil && !strings.Contains(msg, "data unchanged") {
+		// Containers may be stopped or data partly swapped: surface it rather than report the old state.
+		final = "failed"
+	}
+	_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, final, msg).Get(ctx, nil)
 	if werr != nil {
 		return failOp(werr)
 	}

@@ -31,3 +31,10 @@
 | Tests | Go unit tests are thin; there are no Go integration tests in CI (e2e needs the full stack) |
 | Overlay at scale | Each apply restarts Nebula only when its config changes; WireGuard uses `wg syncconf` (no tunnel drop). Not yet tested beyond two hosts, across NAT, or with IPv6 endpoints; hosts that are offline during a mesh change converge only on the next change |
 | Backups hardening | Local REST server runs without auth (repositories are still encrypted client-side). Missing: per-tenant repo credentials, append-only/immutable storage, restore into a new service, backup billing, and tests with large volumes or long-running databases (quiesce means brief downtime) |
+
+### Backup hardening (review of #9)
+- The restic REST server now requires HTTP basic auth (`scripts/backup-repo-user.sh` creates the user and prints `SPADE_BACKUP_REPO`); without a user every request is 401 and the `backups` capability reports the rejected credentials. Still one shared credential for all tenants: per-tenant users with `--private-repos` and append-only storage remain open.
+- Restore checks the snapshot is still in the service's repository and that every snapshot path is one of the service's volumes or its stack dir, restores into a staging dir with `--include` for those paths only, and only then stops the app and swaps data. Failures before the swap report `data unchanged` and keep the service state; failures during the swap mark the service `failed` instead of hiding it.
+- Backing up a stopped service no longer starts it (quiesce only touches running containers).
+- Backups pruned by retention are marked `pruned` and can no longer be selected for restore.
+

@@ -56,3 +56,5 @@ The signed payment-credit hook (`/internal/payments/verified`) is served only on
 All services read `SPADE_DATABASE_URL`, not the generic `DATABASE_URL`, so they never pick up another project's database by accident. The local defaults in `internal/config` are for development only.
 
 See [docs/READINESS.md](docs/READINESS.md) for an honest production-readiness assessment.
+
+The local backup repository requires a user: run `scripts/backup-repo-user.sh` after `docker compose up` and export the printed `SPADE_BACKUP_REPO` values (one for the gateway, one for the API probe). The password is generated locally and never committed. That local repo is plain HTTP, so the gateway refuses to send credentials to it unless `SPADE_BACKUP_ALLOW_PLAINTEXT=1` (local dev only); production repositories must be `rest:https://`.
