@@ -12,6 +12,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -85,9 +87,23 @@ func (s *Server) Router() http.Handler {
 	return r
 }
 
+// allowedOrigin restricts browser access to the configured client origins (SPADE_ALLOWED_ORIGINS, comma separated).
+func allowedOrigin(o string) bool {
+	list := os.Getenv("SPADE_ALLOWED_ORIGINS")
+	if list == "" {
+		list = "http://localhost:5173"
+	}
+	for _, a := range strings.Split(list, ",") {
+		if strings.TrimSpace(a) == o {
+			return true
+		}
+	}
+	return false
+}
+
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if o := r.Header.Get("Origin"); o != "" {
+		if o := r.Header.Get("Origin"); o != "" && allowedOrigin(o) {
 			w.Header().Set("Access-Control-Allow-Origin", o)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
