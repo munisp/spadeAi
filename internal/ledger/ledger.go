@@ -194,6 +194,10 @@ func (l *Ledger) Relay(ctx context.Context, limit int) (*RelayResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tigerbeetle create transfers: %w", err)
 	}
+	// tigerbeetle-go 0.17 returns one result per submitted transfer, in order. Refuse to guess otherwise.
+	if len(res) != len(batch) {
+		return nil, fmt.Errorf("tigerbeetle returned %d results for %d transfers", len(res), len(batch))
+	}
 	seenUnpaid := map[string]bool{}
 	for i, r := range res {
 		b := batch[i]

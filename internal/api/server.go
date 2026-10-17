@@ -60,7 +60,6 @@ func (s *Server) Router() http.Handler {
 	})
 	r.Get("/v1/templates", s.listTemplates)
 	r.Get("/v1/sizes", s.listSizes)
-	r.Post("/internal/payments/verified", s.paymentVerified)
 	r.Group(func(r chi.Router) {
 		r.Use(s.authn)
 		r.Get("/v1/me", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, userFrom(r.Context())) })
@@ -86,6 +85,16 @@ func (s *Server) Router() http.Handler {
 	})
 	return r
 }
+
+// InternalRouter serves service-to-service hooks. Bind it to a private interface only (SPADE_INTERNAL_LISTEN).
+func (s *Server) InternalRouter() http.Handler {
+	r := chi.NewRouter()
+	r.Post("/internal/payments/verified", s.paymentVerified)
+	return r
+}
+
+// errAuthz marks a transaction aborted because the Permify relationship write failed.
+type errAuthz struct{ error }
 
 // allowedOrigin restricts browser access to the configured client origins (SPADE_ALLOWED_ORIGINS, comma separated).
 func allowedOrigin(o string) bool {
@@ -183,14 +192,16 @@ func (s *Server) createOrg(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(r.Context(), `INSERT INTO org_member(user_id,org_id,role) VALUES ($1,$2,'owner')`, u.ID, orgID); err != nil {
 			return err
 		}
-		return audit.Append(r.Context(), tx, audit.Event{Actor: u.ID, Verb: "org.create", TargetKind: "organization", TargetID: orgID, Detail: map[string]any{"name": in.Name, "billing_mode": in.BillingMode, "ai_policy": in.AIPolicy}})
+		if err := audit.Append(r.Context(), tx, audit.Event{Actor: u.ID, Verb: "org.create", TargetKind: "organization", TargetID: orgID, Detail: map[string]any{"name": in.Name, "billing_mode": in.BillingMode, "ai_policy": in.AIPolicy}}); err != nil {
+			return err
+		}
+		// Last step before commit: if Permify is down the org is rolled back, so a retry starts clean.
+		if err := s.Authz.Write(r.Context(), authz.T("organization", orgID, "owner", "user", u.ID)); err != nil {
+			return errAuthz{err}
+		}
+		return nil
 	})
-	if err != nil {
-		writeErr(w, 400, "create_failed", err.Error())
-		return
-	}
-	if err := s.Authz.Write(r.Context(), authz.T("organization", orgID, "owner", "user", u.ID)); err != nil {
-		writeErr(w, 503, "authz_unavailable", err.Error())
+	if writeTxErr(w, err, "create_failed") {
 		return
 	}
 	if _, err := s.Ledger.EnsureAccount(r.Context(), "org_wallet", orgID, "NGN", in.BillingMode == "prepaid"); err != nil {
@@ -208,6 +219,10 @@ func (s *Server) listOrgs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) wallet(w http.ResponseWriter, r *http.Request) {
 	org := chi.URLParam(r, "org")
 	if !s.allow(w, r, "organization", org, "view") {
+		return
+	}
+	if err := s.ensureWallet(r.Context(), org, "NGN"); err != nil {
+		writeErr(w, 503, "ledger_unavailable", err.Error())
 		return
 	}
 	b, err := s.Ledger.WalletBalance(org, "NGN")
@@ -258,14 +273,15 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(r.Context(), `INSERT INTO membership(user_id,project_id,role) VALUES ($1,$2,'owner')`, u.ID, id); err != nil {
 			return err
 		}
-		return audit.Append(r.Context(), tx, audit.Event{Actor: u.ID, Verb: "project.create", TargetKind: "project", TargetID: id, Detail: map[string]any{"org_id": org, "overlay": in.Overlay}})
+		if err := audit.Append(r.Context(), tx, audit.Event{Actor: u.ID, Verb: "project.create", TargetKind: "project", TargetID: id, Detail: map[string]any{"org_id": org, "overlay": in.Overlay}}); err != nil {
+			return err
+		}
+		if err := s.Authz.Write(r.Context(), authz.T("project", id, "org", "organization", org), authz.T("project", id, "owner", "user", u.ID)); err != nil {
+			return errAuthz{err}
+		}
+		return nil
 	})
-	if err != nil {
-		writeErr(w, 400, "create_failed", err.Error())
-		return
-	}
-	if err := s.Authz.Write(r.Context(), authz.T("project", id, "org", "organization", org), authz.T("project", id, "owner", "user", u.ID)); err != nil {
-		writeErr(w, 503, "authz_unavailable", err.Error())
+	if writeTxErr(w, err, "create_failed") {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"id": id, "org_id": org, "name": in.Name, "overlay": in.Overlay})
@@ -295,17 +311,34 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
+		var prev string
+		if err := tx.QueryRow(r.Context(), `SELECT role FROM membership WHERE user_id=$1 AND project_id=$2 FOR UPDATE`, uid, p).Scan(&prev); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if prev == "owner" {
+			return fmt.Errorf("the project owner's role cannot be changed here")
+		}
 		if _, err := tx.Exec(r.Context(), `INSERT INTO membership(user_id,project_id,role) VALUES ($1,$2,$3) ON CONFLICT (user_id,project_id) DO UPDATE SET role=EXCLUDED.role`, uid, p, in.Role); err != nil {
 			return err
 		}
-		return audit.Append(r.Context(), tx, audit.Event{Actor: userFrom(r.Context()).ID, Verb: "project.member.add", TargetKind: "project", TargetID: p, Detail: map[string]any{"user_id": uid, "role": in.Role}})
+		if err := audit.Append(r.Context(), tx, audit.Event{Actor: userFrom(r.Context()).ID, Verb: "project.member.add", TargetKind: "project", TargetID: p, Detail: map[string]any{"user_id": uid, "role": in.Role, "previous_role": prev}}); err != nil {
+			return err
+		}
+		// Exactly one role tuple per member: drop every other role so a demotion removes old privileges.
+		for role := range valid {
+			if role == in.Role {
+				continue
+			}
+			if err := s.Authz.Delete(r.Context(), authz.T("project", p, role, "user", uid)); err != nil {
+				return errAuthz{err}
+			}
+		}
+		if err := s.Authz.Write(r.Context(), authz.T("project", p, in.Role, "user", uid)); err != nil {
+			return errAuthz{err}
+		}
+		return nil
 	})
-	if err != nil {
-		writeErr(w, 400, "failed", err.Error())
-		return
-	}
-	if err := s.Authz.Write(r.Context(), authz.T("project", p, in.Role, "user", uid)); err != nil {
-		writeErr(w, 503, "authz_unavailable", err.Error())
+	if writeTxErr(w, err, "failed") {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"user_id": uid, "role": in.Role})
@@ -408,7 +441,7 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 	var existing bool
 	err := s.tx(r.Context(), func(tx pgx.Tx) error {
 		var err error
-		opID, existing, err = s.startOperation(r.Context(), tx, key, "service.create", "service", body)
+		opID, existing, err = s.startOperation(r.Context(), tx, key, "service.create", "service", append([]byte(chi.URLParam(r, "project")+"|"), body...))
 		if err != nil || existing {
 			return err
 		}
@@ -578,6 +611,10 @@ func (s *Server) paymentVerified(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "ledger_unavailable", err.Error())
 		return
 	}
+	if err := s.ensureWallet(r.Context(), in.OrgID, in.Currency); err != nil {
+		writeErr(w, 503, "ledger_unavailable", err.Error())
+		return
+	}
 	ref := in.Provider + ":" + in.ProviderRef
 	err = s.tx(r.Context(), func(tx pgx.Tx) error {
 		if _, err := tx.Exec(r.Context(), `INSERT INTO payment(org_id,provider,provider_ref,amount_minor,currency,status,verified_at,raw_event)
@@ -603,6 +640,30 @@ func (s *Server) paymentVerified(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- helpers ----
+
+// ensureWallet idempotently (re)creates an org's TigerBeetle wallet, repairing orgs whose wallet
+// creation failed after the org row committed.
+func (s *Server) ensureWallet(ctx context.Context, org, currency string) error {
+	var mode string
+	if err := s.Pool.QueryRow(ctx, `SELECT billing_mode FROM organization WHERE id=$1`, org).Scan(&mode); err != nil {
+		return fmt.Errorf("organization %s: %w", org, err)
+	}
+	_, err := s.Ledger.EnsureAccount(ctx, "org_wallet", org, currency, mode == "prepaid")
+	return err
+}
+
+func writeTxErr(w http.ResponseWriter, err error, kind string) bool {
+	var az errAuthz
+	switch {
+	case err == nil:
+		return false
+	case errors.As(err, &az):
+		writeErr(w, 503, "authz_unavailable", az.Error())
+	default:
+		writeErr(w, 400, kind, err.Error())
+	}
+	return true
+}
 
 func (s *Server) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.Pool.Begin(ctx)

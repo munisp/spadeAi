@@ -65,16 +65,31 @@ func run(ctx context.Context, log *slog.Logger) error {
 	caps := capability.New(pool)
 	registerProbes(caps, pool.Ping, led, tc, verifier, az)
 	go caps.Loop(ctx, 15*time.Second)
+	secret := os.Getenv("SPADE_INTERNAL_SECRET")
+	if secret != "" && len(secret) < minInternalSecret {
+		log.Error("SPADE_INTERNAL_SECRET is too short; payment credit hook disabled", "min_len", minInternalSecret)
+		secret = ""
+	}
 	s := &api.Server{Pool: pool, Auth: verifier, Authz: az, Ledger: led, Caps: caps, WF: workflows.Starter{C: tc},
-		InternalSecret: os.Getenv("SPADE_INTERNAL_SECRET"), Log: log}
+		InternalSecret: secret, Log: log}
+	internal := &http.Server{Addr: config.Get("SPADE_INTERNAL_LISTEN", "127.0.0.1:8081"), Handler: s.InternalRouter(), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		log.Info("spade-api internal listener", "addr", internal.Addr)
+		if err := internal.ListenAndServe(); err != http.ErrServerClosed {
+			log.Error("internal listener", "err", err)
+		}
+	}()
 	srv := &http.Server{Addr: config.Get("LISTEN", ":8080"), Handler: s.Router(), ReadHeaderTimeout: 10 * time.Second}
-	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
+	go func() { <-ctx.Done(); srv.Shutdown(context.Background()); internal.Shutdown(context.Background()) }()
 	log.Info("spade-api listening", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}
 	return nil
 }
+
+// minInternalSecret is 32 bytes of hex (openssl rand -hex 16) at minimum; shorter, guessable secrets are refused.
+const minInternalSecret = 32
 
 func registerProbes(c *capability.Registry, pgPing func(context.Context) error, led *ledger.Ledger, tc client.Client, v *auth.Verifier, az *authz.Client) {
 	c.Register("postgres", func(ctx context.Context) (string, string) { return capability.FromErr(pgPing(ctx)) })
@@ -94,10 +109,13 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 	})
 	c.Register("keycloak", func(ctx context.Context) (string, string) { return capability.FromErr(v.Ready(ctx)) })
 	c.Register("permify", func(ctx context.Context) (string, string) { return capability.FromErr(az.Healthy(ctx)) })
-	for _, ext := range []struct{ name, env, path string }{
-		{"payments", "PAYMENTS_URL", "/capabilities"},
-		{"ai_devops", "AI_DEVOPS_URL", "/healthz"},
-		{"agent_gateway", "GATEWAY_HEALTH_URL", "/healthz"},
+	for _, ext := range []struct {
+		name, env, path string
+		privateCA       bool
+	}{
+		{"payments", "PAYMENTS_URL", "/capabilities", false},
+		{"ai_devops", "AI_DEVOPS_URL", "/healthz", false},
+		{"agent_gateway", "GATEWAY_HEALTH_URL", "/healthz", true},
 	} {
 		ext := ext
 		c.Register(ext.name, func(ctx context.Context) (string, string) {
@@ -106,7 +124,15 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 				return "unavailable", ext.env + " not configured"
 			}
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+ext.path, nil)
-			cl := &http.Client{Timeout: 3 * time.Second, Transport: insecureLocal()}
+			// Public integrations are verified against system roots; the gateway against the agent CA. Never skip verification.
+			cl := &http.Client{Timeout: 3 * time.Second}
+			if ext.privateCA {
+				t, err := gatewayTransport()
+				if err != nil {
+					return "unavailable", err.Error()
+				}
+				cl.Transport = t
+			}
 			resp, err := cl.Do(req)
 			if err != nil {
 				return "unavailable", err.Error()

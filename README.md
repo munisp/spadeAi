@@ -39,12 +39,15 @@ Sovereign, Nigeria-first managed open-source platform. It does one-click deploym
 docker compose -f deploy/compose/docker-compose.yml up -d
 go build -o bin/ ./cmd/... && (cd rust && cargo build --release)
 python3 -m venv .venv && .venv/bin/pip install -e 'python[dev]'
+export SPADE_INTERNAL_SECRET=$(openssl rand -hex 32)   # >= 32 chars or the payment hook stays disabled
 ./bin/spade-gateway &                      # :8443 (mTLS)
-SPADE_INTERNAL_SECRET=dev ./bin/spade-api &   # :8080
+./bin/spade-api &                          # :8080 public, 127.0.0.1:8081 internal payment hook
 ./bin/spade-worker &
-SPADE_INTERNAL_SECRET=dev ./scripts/e2e.sh
+./scripts/e2e.sh
 ```
 `scripts/e2e.sh` runs a real deploy through the Rust agent, then checks the funds-check hold is voided, that a rejected debit suspends the org and records arrears, that a top-up settles arrears and resumes the org, and that the audit chain is intact.
+
+The signed payment-credit hook (`/internal/payments/verified`) is served only on `SPADE_INTERNAL_LISTEN` (default `127.0.0.1:8081`), never on the public listener. Point the payments service at it with `CORE_INTERNAL_URL`.
 
 All services read `SPADE_DATABASE_URL`, not the generic `DATABASE_URL`, so they never pick up another project's database by accident. The local defaults in `internal/config` are for development only.
 

@@ -1,14 +1,17 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { Paystack, Flutterwave, Provider, creditCore } from "./providers.js";
+import { corsHeaders } from "./cors.js";
 
 const CORE = process.env.CORE_API_URL ?? "http://localhost:8080";
+// Private listener of spade-api that accepts signed payment credits (SPADE_INTERNAL_LISTEN).
+const CORE_INTERNAL = process.env.CORE_INTERNAL_URL ?? "http://localhost:8081";
 const SECRET = process.env.SPADE_INTERNAL_SECRET ?? "";
 const CALLBACK = process.env.PAYMENT_CALLBACK_URL ?? "http://localhost:5173/billing";
 const providers: Record<string, Provider> = { paystack: new Paystack(), flutterwave: new Flutterwave() };
 
 function send(res: ServerResponse, code: number, body: unknown) {
-  res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Authorization, Content-Type" });
+  res.writeHead(code, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
@@ -28,6 +31,7 @@ export function capabilities() {
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", "http://x");
+    for (const [k, v] of Object.entries(corsHeaders(req.headers.origin))) res.setHeader(k, v);
     if (req.method === "OPTIONS") return send(res, 204, {});
     if (req.method === "GET" && url.pathname === "/capabilities") { const c = capabilities(); return send(res, c.code, c.body); }
     if (req.method === "POST" && url.pathname === "/v1/topups") {
@@ -52,7 +56,7 @@ const server = createServer(async (req, res) => {
       if (!ref) return send(res, 200, { ignored: true });
       const charge = await p.verify(String(ref));
       if (!charge) return send(res, 200, { ignored: "not a successful NGN charge" });
-      return send(res, 200, await creditCore(charge, CORE, SECRET));
+      return send(res, 200, await creditCore(charge, CORE_INTERNAL, SECRET));
     }
     send(res, 404, { error: "not found" });
   } catch (e) {

@@ -83,7 +83,12 @@ async fn enrol(gateway: &str, ca: &Path, token: &str, state: &Path) -> Result<()
     std::fs::create_dir_all(state)?;
     write_private(&state.join("agent.key"), key.serialize_pem().as_bytes())?;
     std::fs::write(state.join("agent.crt"), body["cert_pem"].as_str().ok_or(anyhow!("no cert"))?)?;
-    std::fs::write(state.join("ca.pem"), body["ca_pem"].as_str().ok_or(anyhow!("no ca"))?)?;
+    // Keep the CA that was pinned out of band; never adopt a different CA offered by the gateway.
+    let offered = body["ca_pem"].as_str().ok_or(anyhow!("no ca"))?;
+    if offered.trim() != String::from_utf8_lossy(&ca_pem).trim() {
+        bail!("gateway offered a CA that differs from the pinned CA; refusing enrolment");
+    }
+    std::fs::write(state.join("ca.pem"), &ca_pem)?;
     println!("enrolled as agent {}", body["agent_id"].as_str().unwrap_or("?"));
     Ok(())
 }
@@ -134,11 +139,7 @@ async fn run(gateway: &str, state: &Path, stacks: &Path) -> Result<()> {
                     Err(e) => ("failed", json!({"error": format!("{e:#}")})),
                 };
                 eprintln!("command {} {} -> {}", cmd.id, cmd.verb, status);
-                let _ = client
-                    .post(format!("{gateway}/agent/v1/commands/{}/result", cmd.id))
-                    .json(&json!({"status": status, "result": result}))
-                    .send()
-                    .await;
+                report(&client, gateway, &cmd.id, &json!({"status": status, "result": result})).await;
             }
             Ok(r) => {
                 eprintln!("gateway returned {}", r.status());
@@ -157,6 +158,26 @@ async fn run(gateway: &str, state: &Path, stacks: &Path) -> Result<()> {
     }
 }
 
+/// Delivers a command result, retrying transient failures so a completed command is not lost.
+/// Gives up on 4xx (e.g. 409: the command already expired or was recorded).
+async fn report(client: &reqwest::Client, gateway: &str, id: &str, body: &Value) {
+    let mut wait = 1u64;
+    for attempt in 1..=30 {
+        match client.post(format!("{gateway}/agent/v1/commands/{id}/result")).json(body).send().await {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_client_error() => {
+                eprintln!("result for {id} rejected: {}", r.status());
+                return;
+            }
+            Ok(r) => eprintln!("result for {id} attempt {attempt}: gateway {}", r.status()),
+            Err(e) => eprintln!("result for {id} attempt {attempt}: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        wait = (wait * 2).min(30);
+    }
+    eprintln!("giving up delivering result for {id}");
+}
+
 /// Validates a compose project name so it can never escape the stacks directory.
 fn project_name(payload: &Value) -> Result<String> {
     let p = payload["project"].as_str().ok_or(anyhow!("payload.project missing"))?;
@@ -167,7 +188,14 @@ fn project_name(payload: &Value) -> Result<String> {
 }
 
 async fn compose(dir: &Path, project: &str, args: &[&str]) -> Result<Value> {
+    // Service env is passed as process environment, never through a .env file, so values are not
+    // re-interpolated by Compose (e.g. a value containing ${HOME} stays literal).
+    let env: std::collections::BTreeMap<String, String> = match std::fs::read(dir.join("env.json")) {
+        Ok(b) => serde_json::from_slice(&b).context("read env.json")?,
+        Err(_) => Default::default(),
+    };
     let out = Command::new("docker")
+        .envs(&env)
         .arg("compose")
         .arg("-p")
         .arg(project)
@@ -197,16 +225,9 @@ async fn execute(cmd: &Command_, stacks: &Path) -> Result<Value> {
             }
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("docker-compose.yml"), compose_text)?;
-            let mut env = String::new();
-            if let Some(m) = cmd.payload["env"].as_object() {
-                for (k, v) in m {
-                    if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                        bail!("invalid env key {k}");
-                    }
-                    env.push_str(&format!("{k}={}\n", v.as_str().unwrap_or_default().replace('\n', "")));
-                }
-            }
-            write_private(&dir.join(".env"), env.as_bytes())?;
+            let env = service_env(&cmd.payload["env"])?;
+            let _ = std::fs::remove_file(dir.join(".env"));
+            write_private(&dir.join("env.json"), &serde_json::to_vec(&env)?)?;
             compose(&dir, &project, &["up", "-d", "--remove-orphans"]).await
         }
         "compose_up" => compose(&dir, &project, &["up", "-d"]).await,
@@ -216,6 +237,23 @@ async fn execute(cmd: &Command_, stacks: &Path) -> Result<Value> {
         "collect_metrics" => compose(&dir, &project, &["ps", "--format", "json"]).await,
         other => bail!("unsupported verb {other}"),
     }
+}
+
+fn service_env(v: &Value) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env = std::collections::BTreeMap::new();
+    if let Some(m) = v.as_object() {
+        for (k, v) in m {
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                bail!("invalid env key {k}");
+            }
+            let val = v.as_str().unwrap_or_default();
+            if val.contains('\0') {
+                bail!("env value for {k} contains NUL");
+            }
+            env.insert(k.clone(), val.to_string());
+        }
+    }
+    Ok(env)
 }
 
 async fn health(h: &Value) -> Result<Value> {
@@ -239,6 +277,12 @@ async fn health(h: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn env_values_are_kept_literal() {
+        let e = service_env(&json!({"A": "${HOME}$PATH", "B": "x'y"})).unwrap();
+        assert_eq!(e["A"], "${HOME}$PATH");
+        assert!(service_env(&json!({"A=B": "x"})).is_err());
+    }
     #[test]
     fn rejects_path_traversal_project() {
         assert!(project_name(&json!({"project": "../etc"})).is_err());

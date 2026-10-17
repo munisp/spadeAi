@@ -62,9 +62,36 @@ def validate(t: Template) -> list[str]:
         for p in svc.get("ports", []) or []:
             if not str(p).startswith("127.0.0.1:"):
                 errs.append(f"service {name}: port {p} must bind 127.0.0.1 (the edge proxy fronts it)")
+        for key in ("network_mode", "pid", "ipc", "userns_mode", "uts", "cgroup"):
+            if str(svc.get(key, "")).startswith(("host", "container:", "service:")):
+                errs.append(f"service {name}: {key}={svc[key]} shares host/other namespaces")
+        for key in ("cap_add", "devices", "device_cgroup_rules", "volumes_from"):
+            if svc.get(key):
+                errs.append(f"service {name}: {key} is not allowed")
+        for opt in svc.get("security_opt", []) or []:
+            if "unconfined" in str(opt) or "disable" in str(opt):
+                errs.append(f"service {name}: security_opt {opt} is not allowed")
+        for v in svc.get("volumes", []) or []:
+            errs += [f"service {name}: {e}" for e in _volume_errors(v)]
+    for vname, vol in ((compose or {}).get("volumes") or {}).items():
+        if isinstance(vol, dict) and (vol.get("driver_opts") or vol.get("external") or vol.get("driver") not in (None, "local")):
+            errs.append(f"volume {vname}: only plain named volumes are allowed")
     if t.path.name != t.manifest.get("slug"):
         errs.append("directory name must equal slug")
     return errs
+
+
+def _volume_errors(v) -> list[str]:
+    """Only named volumes: no host bind mounts (which would expose the host, e.g. the Docker socket)."""
+    if isinstance(v, dict):
+        if v.get("type", "volume") != "volume":
+            return [f"volume mount type {v.get('type')} is not allowed (named volumes only)"]
+        src = str(v.get("source", ""))
+    else:
+        src = str(v).split(":", 1)[0] if ":" in str(v) else ""
+    if src.startswith(("/", ".", "~", "$")) or "docker.sock" in str(v):
+        return [f"host bind mount {v} is not allowed (named volumes only)"]
+    return []
 
 
 def smoke_test(t: Template, timeout: float = 180.0) -> dict:
@@ -117,9 +144,14 @@ def publish(t: Template, dsn: str, report: dict | None) -> None:
             """INSERT INTO template_version(template_id,version,manifest,compose,compose_sha256,min_vcpu,min_ram_mb,tested_at,test_report)
                VALUES (%s,%s,%s,%s,%s,%s,%s, CASE WHEN %s THEN now() END, %s)
                ON CONFLICT (template_id,version) DO UPDATE SET manifest=EXCLUDED.manifest, compose=EXCLUDED.compose,
-                 compose_sha256=EXCLUDED.compose_sha256, tested_at=EXCLUDED.tested_at, test_report=EXCLUDED.test_report""",
+                 compose_sha256=EXCLUDED.compose_sha256,
+                 -- a publish without a passing smoke test keeps the previous result only if the bundle is unchanged
+                 tested_at=CASE WHEN EXCLUDED.tested_at IS NOT NULL THEN EXCLUDED.tested_at
+                   WHEN template_version.compose_sha256=EXCLUDED.compose_sha256 AND %s THEN template_version.tested_at END,
+                 test_report=CASE WHEN EXCLUDED.tested_at IS NOT NULL OR template_version.compose_sha256<>EXCLUDED.compose_sha256 OR NOT %s
+                   THEN EXCLUDED.test_report ELSE template_version.test_report END""",
             (tid, str(m["version"]), json.dumps(m), t.compose, t.sha256, m.get("min_vcpu", 1), m.get("min_ram_mb", 1024),
-             tested, json.dumps(report or {"skipped": True})),
+             tested, json.dumps(report or {"skipped": True}), report is None, report is None),
         )
 
 

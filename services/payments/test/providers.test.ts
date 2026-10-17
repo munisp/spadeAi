@@ -35,3 +35,10 @@ test("flutterwave converts naira to kobo exactly", async () => {
 test("creditCore refuses to run without the internal secret", async () => {
   await assert.rejects(creditCore({ provider: "paystack", providerRef: "r", orgId: "o", amountMinor: 1, currency: "NGN", raw: {} }, "http://x", ""));
 });
+
+test("CORS is granted only to configured client origins", async () => {
+  const { corsHeaders } = await import("../src/cors.js");
+  assert.equal(corsHeaders("http://localhost:5173")["Access-Control-Allow-Origin"], "http://localhost:5173");
+  assert.deepEqual(corsHeaders("https://evil.example"), {});
+  assert.deepEqual(corsHeaders(undefined), {});
+});
