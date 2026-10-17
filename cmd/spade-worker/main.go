@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 	"github.com/munisp/spadeai/internal/config"
 	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
+	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/secrets"
 	"github.com/munisp/spadeai/internal/workflows"
 )
 
@@ -53,14 +57,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 	led := &ledger.Ledger{TB: tbc, Pool: pool}
 	acts := &workflows.Activities{Pool: pool, Ledger: led, HoldHours: config.Int("SPADE_HOLD_HOURS", 24),
 		GatewayURL: config.Get("GATEWAY_PUBLIC_URL", "https://localhost:8443"), CAPin: ca.Pin()}
+	kek, err := secrets.LoadOrCreate(config.KEKFile(), config.Get("SPADE_KEK_CREATE", "true") == "true")
+	if err != nil {
+		log.Warn("KEK unavailable: Nebula overlays and backups disabled", "err", err)
+		kek = nil
+	}
+	nebulaCert, _ := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert"))
+	acts.Overlay = &overlay.Controller{Pool: pool, KEK: kek, NebulaCert: nebulaCert}
+	acts.KEK = kek
+	acts.Clouds = registry.ByName(registry.FromEnv())
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)
 	w.RegisterWorkflow(workflows.SuspendOrg)
 	w.RegisterWorkflow(workflows.ResumeOrg)
+	w.RegisterWorkflow(workflows.BackupService)
+	w.RegisterWorkflow(workflows.RestoreService)
 	w.RegisterActivity(acts)
 	rater := &workflows.Rater{A: acts, Temporal: tc, Log: log}
 	go rater.Loop(ctx, time.Duration(config.Int("SPADE_RATING_INTERVAL_SEC", 60))*time.Second)
+	sched := &workflows.BackupScheduler{A: acts, Temporal: tc, Log: log}
+	go sched.Loop(ctx, time.Duration(config.Int("SPADE_BACKUP_SCHEDULE_SEC", 3600))*time.Second)
 	log.Info("spade-worker started", "task_queue", workflows.TaskQueue)
 	return w.Run(worker.InterruptCh())
 }

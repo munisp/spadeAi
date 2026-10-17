@@ -110,6 +110,9 @@ const usage = `spade — SpadeAi CLI
   spade templates
   spade deploy PROJECT_ID TEMPLATE NAME SIZE
   spade services PROJECT_ID
+  spade backups list|create SERVICE_ID
+  spade backups restore SERVICE_ID BACKUP_ID   (overwrites current data)
+  spade overlay PROJECT_ID          (private network members, IPs, sync state)
   spade action SERVICE_ID start|stop|restart|delete
   spade op OPERATION_ID [--wait]
   spade audit verify`
@@ -217,6 +220,27 @@ func run(a []string) error {
 			}
 			time.Sleep(2 * time.Second)
 		}
+	case "overlay":
+		if err := need(2); err != nil {
+			return err
+		}
+		return show(call(c, "GET", "/v1/projects/"+url.PathEscape(a[1])+"/overlay", nil, false))
+	case "backups":
+		if err := need(3); err != nil {
+			return err
+		}
+		switch a[1] {
+		case "list":
+			return show(call(c, "GET", "/v1/services/"+url.PathEscape(a[2])+"/backups", nil, false))
+		case "create":
+			return show(call(c, "POST", "/v1/services/"+url.PathEscape(a[2])+"/backups", nil, true))
+		case "restore":
+			if err := need(4); err != nil {
+				return err
+			}
+			return show(call(c, "POST", "/v1/services/"+url.PathEscape(a[2])+"/backups/"+url.PathEscape(a[3])+"/restore", nil, true))
+		}
+		return errors.New("usage: spade backups list|create SERVICE_ID | restore SERVICE_ID BACKUP_ID")
 	case "audit":
 		return show(call(c, "GET", "/v1/audit-events/verify", nil, false))
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,16 +17,24 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/munisp/spadeai/internal/audit"
+	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
+	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/providers/cloud"
+	"github.com/munisp/spadeai/internal/secrets"
 )
 
 type Activities struct {
+	KEK       *secrets.KEK        // seals per-service backup passwords; nil disables backups (fail closed)
+	Overlay   *overlay.Controller // nil disables private networks (deploys into projects then fail closed)
 	Pool      *pgxpool.Pool
 	Ledger    *ledger.Ledger
 	HoldHours int64
 	// GatewayURL / CAPin are embedded in the BYOVM bootstrap command shown to the user.
 	GatewayURL string
 	CAPin      string
+	// Clouds holds the API provider drivers by provider id; one without its token fails deploys closed.
+	Clouds map[string]cloud.Driver
 }
 
 func nonRetryable(format string, args ...any) error {
@@ -33,6 +42,9 @@ func nonRetryable(format string, args ...any) error {
 }
 
 func (a *Activities) MarkOperation(ctx context.Context, opID, status, workflowID, errMsg string, response map[string]any) error {
+	if opID == "" {
+		return nil // system-initiated workflow (e.g. scheduled backup) without a user operation
+	}
 	var resp any
 	if response != nil {
 		b, _ := json.Marshal(response)
@@ -146,7 +158,11 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 	if err != nil {
 		return nil, err
 	}
-	if s.Provider != "byovm" {
+	d := a.Clouds[s.Provider]
+	switch {
+	case d != nil && !d.Configured():
+		return nil, nonRetryable("provider %s unavailable: %s not configured", s.Provider, d.TokenEnv())
+	case d == nil && s.Provider != "byovm":
 		return nil, nonRetryable("provider %q has no driver configured", s.Provider)
 	}
 	if a.GatewayURL == "" || a.CAPin == "" {
@@ -166,7 +182,70 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 		return nil, err
 	}
 	cmd := fmt.Sprintf("curl -fsSL --insecure %s/agent/v1/install.sh | sudo SPADE_GATEWAY=%s SPADE_CA_SHA256=%s SPADE_ENROL_TOKEN=%s sh", a.GatewayURL, a.GatewayURL, a.CAPin, token)
+	if d != nil {
+		return a.provisionCloud(ctx, d, serviceID, token, hex.EncodeToString(sum[:8]), exp)
+	}
 	return &ProvisionResult{Bootstrap: cmd, EnrolExpiresAt: exp}, nil
+}
+
+// Host dependencies on a stock ubuntu-24.04 image: Docker + Compose for stacks, WireGuard tools and
+// pinned Nebula for overlays, restic for backups.
+var (
+	safeGatewayURL = regexp.MustCompile(`^https://[A-Za-z0-9.\-]+(:[0-9]{1,5})?(/[A-Za-z0-9._\-/]*)?$`)
+	hexOnly        = regexp.MustCompile(`^[0-9a-f]+$`)
+)
+
+var hostPackages = []string{"docker.io", "docker-compose-v2", "wireguard-tools", "restic", "curl", "openssl"}
+
+const nebulaInstall = `curl -fsSL -o /tmp/nebula.tgz https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz && ` +
+	`echo "af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71  /tmp/nebula.tgz" | sha256sum -c - && ` +
+	`tar -xzf /tmp/nebula.tgz -C /usr/local/bin nebula nebula-cert && rm /tmp/nebula.tgz`
+
+// provisionCloud creates the server whose cloud-init installs host dependencies and runs the embedded
+// agent installer. The attempt tag ties the server to this enrolment token.
+func (a *Activities) provisionCloud(ctx context.Context, d cloud.Driver, serviceID, token, attempt string, exp time.Time) (*ProvisionResult, error) {
+	var code string
+	if err := a.Pool.QueryRow(ctx, `SELECT z.code FROM service s JOIN size z ON z.id=s.size_id WHERE s.id=$1`, serviceID).Scan(&code); err != nil {
+		return nil, err
+	}
+	// Reconcile by tag on every attempt, whether or not provider_ref was recorded.
+	if err := cloud.DeleteOthers(ctx, d, serviceID, attempt); err != nil {
+		return nil, err
+	}
+	// Values are interpolated into a root shell command, so only accept URL/hex characters.
+	if !safeGatewayURL.MatchString(a.GatewayURL) || !hexOnly.MatchString(a.CAPin) || !hexOnly.MatchString(token) {
+		return nil, nonRetryable("GATEWAY_PUBLIC_URL must be https://host[:port][/path] with no quotes or spaces, and the CA pin hex")
+	}
+	run := fmt.Sprintf("SPADE_GATEWAY='%s' SPADE_CA_SHA256='%s' SPADE_ENROL_TOKEN='%s' sh /opt/spade/install.sh", a.GatewayURL, a.CAPin, token)
+	boot := cloud.Boot{Packages: hostPackages, Files: map[string]string{"/opt/spade/install.sh": gateway.InstallScript()},
+		Pre: []string{"passwd -l root", "systemctl enable --now docker", nebulaInstall}, Run: run}
+	srv, _, err := cloud.Ensure(ctx, d, cloud.CreateOpts{ServiceID: serviceID, Attempt: attempt, Size: code, UserData: cloud.CloudInit(boot)})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.Pool.Exec(ctx, `UPDATE service SET provider_ref=$2 WHERE id=$1`, serviceID, srv.ID); err != nil {
+		return nil, err
+	}
+	return &ProvisionResult{Bootstrap: fmt.Sprintf("%s server %s (%s) installs the agent via cloud-init", d.Name(), srv.Name, srv.IPv4), EnrolExpiresAt: exp}, nil
+}
+
+// Deprovision deletes provider infrastructure for API providers; BYOVM hosts belong to the customer.
+func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
+	s, err := a.info(ctx, serviceID)
+	if err != nil {
+		return err
+	}
+	if d := a.Clouds[s.Provider]; d != nil {
+		if !d.Configured() {
+			return nonRetryable("%s server for %s not deleted: %s not configured", s.Provider, serviceID, d.TokenEnv())
+		}
+		if _, err := cloud.DeleteAll(ctx, d, serviceID); err != nil {
+			return err
+		}
+	}
+	// The host is gone or no longer managed: its agent certificate and any enrolment token stop working.
+	_, err = a.Pool.Exec(ctx, `UPDATE agent SET cert_fingerprint=NULL, enrol_token_sha256=NULL, enrol_expires_at=NULL WHERE service_id=$1`, serviceID)
+	return err
 }
 
 func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {
@@ -209,6 +288,12 @@ func (a *Activities) QueueCommand(ctx context.Context, serviceID, verb string) (
 		payload["compose"], payload["compose_sha256"], payload["env"] = compose, sha, e
 	case "health_probe":
 		payload["health"] = m["health"]
+	case "overlay_keygen", "overlay_down":
+		var projectID, kind string
+		if err := a.Pool.QueryRow(ctx, `SELECT p.id::text, p.overlay_kind FROM service s JOIN project p ON p.id=s.project_id WHERE s.id=$1`, serviceID).Scan(&projectID, &kind); err != nil {
+			return "", err
+		}
+		payload["kind"], payload["iface"], payload["listen_port"] = kind, overlay.Iface(kind, projectID), overlay.Port(kind)
 	}
 	b, _ := json.Marshal(payload)
 	var id string
@@ -302,4 +387,150 @@ func collect(ctx context.Context, tx pgx.Tx, q string, args ...any) ([]string, e
 		out = []string{}
 	}
 	return out, err
+}
+
+// OverlayRegister reads the host's overlay_keygen result and records it in the project's overlay
+// (stable IP allocation; Nebula host certificate signing). Returns the project ID.
+func (a *Activities) OverlayRegister(ctx context.Context, serviceID, keygenCmd string) (string, error) {
+	if a.Overlay == nil {
+		return "", nonRetryable("overlay controller not configured")
+	}
+	var raw []byte
+	if err := a.Pool.QueryRow(ctx, `SELECT result FROM agent_command WHERE id=$1 AND status='succeeded'`, keygenCmd).Scan(&raw); err != nil {
+		return "", err
+	}
+	var r struct {
+		PublicKey string `json:"public_key"`
+		Endpoint  string `json:"endpoint"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil || r.PublicKey == "" {
+		return "", nonRetryable("overlay_keygen returned no public key")
+	}
+	pid, err := a.Overlay.Register(ctx, serviceID, r.PublicKey, r.Endpoint)
+	if errors.Is(err, overlay.ErrNebulaUnavailable) {
+		return "", nonRetryable("%v", err)
+	}
+	return pid, err
+}
+
+// OverlaySync queues overlay_apply for every enrolled member of the project; returns service -> command ID.
+func (a *Activities) OverlaySync(ctx context.Context, projectID string) (map[string]string, error) {
+	if a.Overlay == nil {
+		return nil, nonRetryable("overlay controller not configured")
+	}
+	plans, err := a.Overlay.Plan(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for svc, p := range plans {
+		b, _ := json.Marshal(p)
+		var id string
+		err := a.Pool.QueryRow(ctx, `INSERT INTO agent_command(agent_id, verb, payload) SELECT id, 'overlay_apply', $2 FROM agent
+			WHERE service_id=$1 AND cert_fingerprint IS NOT NULL RETURNING id::text`, svc, b).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[svc] = id
+	}
+	return out, nil
+}
+
+// OverlayRemove drops the service from its overlay; returns the project ID ("" if it was not a member).
+func (a *Activities) OverlayRemove(ctx context.Context, serviceID string) (string, error) {
+	if a.Overlay == nil {
+		return "", nil
+	}
+	return a.Overlay.Remove(ctx, serviceID)
+}
+
+// EnsureBackupConfig creates the service's restic password (random, sealed with the KEK) on first use.
+func (a *Activities) EnsureBackupConfig(ctx context.Context, serviceID string) error {
+	if a.KEK == nil {
+		return nonRetryable("backups unavailable: KEK not configured")
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return err
+	}
+	sealed, err := a.KEK.Seal([]byte(hex.EncodeToString(raw)), "backup:"+serviceID)
+	if err != nil {
+		return err
+	}
+	_, err = a.Pool.Exec(ctx, `INSERT INTO service_backup_config(service_id,password_sealed) VALUES ($1,$2) ON CONFLICT (service_id) DO NOTHING`, serviceID, sealed)
+	return err
+}
+
+// QueueBackupCommand queues backup_run/backup_restore carrying only a secret_ref; the gateway injects the
+// repository credentials at delivery.
+func (a *Activities) QueueBackupCommand(ctx context.Context, serviceID, verb, snapshot string) (string, error) {
+	var agentID string
+	var keep int
+	var manifest []byte
+	err := a.Pool.QueryRow(ctx, `SELECT a.id::text, c.keep_daily, tv.manifest FROM service s JOIN template_version tv ON tv.id=s.template_version_id
+		JOIN agent a ON a.service_id=s.id JOIN service_backup_config c ON c.service_id=s.id WHERE s.id=$1 AND a.cert_fingerprint IS NOT NULL`, serviceID).Scan(&agentID, &keep, &manifest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nonRetryable("service %s has no enrolled agent or backup config", serviceID)
+	}
+	if err != nil {
+		return "", err
+	}
+	quiesce := true
+	var m map[string]any
+	_ = json.Unmarshal(manifest, &m)
+	if b, ok := m["backup"].(map[string]any); ok {
+		if q, ok := b["quiesce"].(bool); ok {
+			quiesce = q
+		}
+	}
+	payload := map[string]any{"project": "spade-" + serviceID[:8], "secret_ref": map[string]string{"kind": "backup", "service_id": serviceID},
+		"keep_daily": keep, "quiesce": quiesce}
+	if verb == "backup_restore" {
+		payload["snapshot"] = snapshot
+	}
+	b, _ := json.Marshal(payload)
+	var id string
+	err = a.Pool.QueryRow(ctx, `INSERT INTO agent_command(agent_id, verb, payload, expires_at) VALUES ($1,$2,$3, now() + interval '1 hour') RETURNING id::text`, agentID, verb, b).Scan(&id)
+	return id, err
+}
+
+func (a *Activities) BackupRecord(ctx context.Context, serviceID, opID, kind, restoredFrom string) (string, error) {
+	var id string
+	err := a.Pool.QueryRow(ctx, `INSERT INTO backup_snapshot(service_id, operation_id, kind, restored_from) VALUES ($1, nullif($2,'')::uuid, $3, nullif($4,'')::uuid) RETURNING id::text`,
+		serviceID, opID, kind, restoredFrom).Scan(&id)
+	return id, err
+}
+
+// BackupFinish records the outcome; for backups the restic snapshot id and bytes come from the agent result.
+func (a *Activities) BackupFinish(ctx context.Context, recordID, cmdID, errMsg string) error {
+	if errMsg != "" {
+		_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot SET status='failed', error=$2, finished_at=now() WHERE id=$1`, recordID, errMsg)
+		return err
+	}
+	_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot b SET status='succeeded', finished_at=now(), restic_snapshot_id=c.result->>'snapshot_id',
+		bytes_added=(c.result->>'bytes_added')::bigint FROM agent_command c WHERE b.id=$1 AND c.id=$2`, recordID, cmdID)
+	if err != nil {
+		return err
+	}
+	// Retire backups whose snapshot retention pruned, so they are never offered for restore.
+	_, err = a.Pool.Exec(ctx, `UPDATE backup_snapshot o SET status='pruned'
+		FROM backup_snapshot b JOIN agent_command c ON c.id=$2
+		WHERE b.id=$1 AND b.kind='backup' AND o.service_id=b.service_id AND o.kind='backup' AND o.status='succeeded'
+		  AND o.restic_snapshot_id IS NOT NULL AND jsonb_typeof(c.result->'kept')='array'
+		  AND NOT jsonb_exists(c.result->'kept', o.restic_snapshot_id)`, recordID, cmdID)
+	return err
+}
+
+// BackupSnapshotID resolves a succeeded backup of this service to its restic snapshot id.
+func (a *Activities) BackupSnapshotID(ctx context.Context, serviceID, backupID string) (string, error) {
+	var snap string
+	err := a.Pool.QueryRow(ctx, `SELECT restic_snapshot_id FROM backup_snapshot WHERE id=$1 AND service_id=$2 AND kind='backup' AND status='succeeded' AND restic_snapshot_id IS NOT NULL`,
+		backupID, serviceID).Scan(&snap)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nonRetryable("backup %s is not a completed backup of service %s", backupID, serviceID)
+	}
+	return snap, err
 }

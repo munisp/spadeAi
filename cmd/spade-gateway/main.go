@@ -11,6 +11,7 @@ import (
 	"github.com/munisp/spadeai/db"
 	"github.com/munisp/spadeai/internal/config"
 	"github.com/munisp/spadeai/internal/gateway"
+	"github.com/munisp/spadeai/internal/secrets"
 )
 
 func main() {
@@ -35,7 +36,13 @@ func main() {
 		log.Error("tls", "err", err)
 		os.Exit(1)
 	}
-	s := &gateway.Server{Pool: pool, CA: ca, DistDir: config.Get("SPADE_AGENT_DIST", "./dist")}
+	kek, err := secrets.LoadOrCreate(config.KEKFile(), config.Get("SPADE_KEK_CREATE", "true") == "true")
+	if err != nil {
+		log.Warn("KEK unavailable: backup credentials cannot be delivered", "err", err)
+		kek = nil
+	}
+	s := &gateway.Server{Pool: pool, CA: ca, DistDir: config.Get("SPADE_AGENT_DIST", "./dist"), KEK: kek, BackupRepo: config.Get("SPADE_BACKUP_REPO", ""),
+		AllowPlaintextBackupRepo: config.Get("SPADE_BACKUP_ALLOW_PLAINTEXT", "") == "1"}
 	srv := &http.Server{Addr: config.Get("LISTEN", ":8443"), Handler: s.Router(), TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second}
 	log.Info("spade-gateway listening", "addr", srv.Addr, "ca_pin", ca.Pin())
 	if err := srv.ListenAndServeTLS("", ""); err != nil {

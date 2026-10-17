@@ -11,7 +11,8 @@ const API = extra.api;
 
 type Org = { id: string; name: string; billing_mode: string };
 type Wallet = { arrears_minor: number; balance: { available_minor: number; pending_debits_minor: number } };
-type Service = { id: string; display_name: string; template: string; state: string };
+type Service = { id: string; display_name: string; template: string; state: string; overlay_ip?: string };
+type Overlay = { kind: string; peers: { service_id: string; overlay_ip: string }[] };
 type Project = { id: string; name: string; org_id: string };
 
 const naira = (k: number) => `₦${(k / 100).toLocaleString("en-NG", { minimumFractionDigits: 2 })}`;
@@ -49,7 +50,11 @@ export default function App() {
     setOrg(o);
     setWallet(await call(`/v1/orgs/${o.id}/wallet`));
     const ps = ((await call<{ items: Project[] }>("/v1/projects")).items ?? []).filter(p => p.org_id === o.id);
-    const all = await Promise.all(ps.map(async p => ((await call<{ items: Service[] }>(`/v1/projects/${p.id}/services`)).items ?? []).map(s => ({ ...s, project: p.name }))));
+    const all = await Promise.all(ps.map(async p => {
+      const [svcs, ov] = await Promise.all([call<{ items: Service[] }>(`/v1/projects/${p.id}/services`), call<Overlay>(`/v1/projects/${p.id}/overlay`)]);
+      const ips = new Map((ov.peers ?? []).map(x => [x.service_id, x.overlay_ip]));
+      return (svcs.items ?? []).map(s => ({ ...s, project: `${p.name} · ${ov.kind}`, overlay_ip: ips.get(s.id) }));
+    }));
     setServices(all.flat());
   };
   const act = (s: Service, a: string) => call(`/v1/services/${s.id}/actions/${a}`, { method: "POST", idempotent: true }).then(() => open(org!)).catch(fail);
@@ -62,8 +67,9 @@ export default function App() {
     <Text style={st.h}>{org.name}</Text>
     {wallet && <Text>Available {naira(wallet.balance.available_minor)} · Reserved {naira(wallet.balance.pending_debits_minor)} · Arrears {naira(wallet.arrears_minor)}</Text>}
     <FlatList data={services} keyExtractor={s => s.id} renderItem={({ item }) => <View style={st.card}>
-      <Text style={{ fontWeight: "600" }}>{item.display_name} · {item.project}</Text><Text>{item.template} — {item.state}</Text>
-      <View style={{ flexDirection: "row" }}>{["start", "stop", "restart"].map(a => <Button key={a} title={a} onPress={() => act(item, a)} />)}</View>
+      <Text style={{ fontWeight: "600" }}>{item.display_name} · {item.project}</Text><Text>{item.template} — {item.state}{item.overlay_ip ? ` · private IP ${item.overlay_ip}` : ""}</Text>
+      <View style={{ flexDirection: "row" }}>{["start", "stop", "restart"].map(a => <Button key={a} title={a} onPress={() => act(item, a)} />)}
+        <Button title="back up" onPress={() => call(`/v1/services/${item.id}/backups`, { method: "POST", idempotent: true }).then(() => Alert.alert("SpadeAi", "Backup started")).catch(fail)} /></View>
     </View>} />
   </SafeAreaView>;
 }

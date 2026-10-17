@@ -1,0 +1,14 @@
+slug: static-site
+name: Static site (nginx)
+category: web
+licence_spdx: BSD-2-Clause
+description: nginx serving files from a persistent named volume; used to verify backup and restore.
+version: "1.27"
+min_vcpu: 1
+min_ram_mb: 128
+health:
+  port: 18081
+  path: /
+  expect_status: [200, 403]
+backup:
+  quiesce: true

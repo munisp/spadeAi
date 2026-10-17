@@ -32,6 +32,8 @@ import (
 type Workflows interface {
 	StartDeploy(ctx context.Context, operationID, serviceID string) (string, error)
 	StartAction(ctx context.Context, operationID, serviceID, action string) (string, error)
+	StartBackup(ctx context.Context, operationID, serviceID string) (string, error)
+	StartRestore(ctx context.Context, operationID, serviceID, backupID string) (string, error)
 }
 
 type Server struct {
@@ -71,9 +73,13 @@ func (s *Server) Router() http.Handler {
 		r.Get("/v1/projects", s.listProjects)
 		r.Post("/v1/projects/{project}/members", s.addMember)
 		r.Get("/v1/projects/{project}/services", s.listServices)
+		r.Get("/v1/projects/{project}/overlay", s.getOverlay)
 		r.Post("/v1/projects/{project}/services", s.createService)
 		r.Get("/v1/services/{service}", s.getService)
 		r.Post("/v1/services/{service}/actions/{action}", s.serviceAction)
+		r.Get("/v1/services/{service}/backups", s.listBackups)
+		r.Post("/v1/services/{service}/backups", s.createBackup)
+		r.Post("/v1/services/{service}/backups/{backup}/restore", s.restoreBackup)
 		r.Delete("/v1/services/{service}", func(w http.ResponseWriter, r *http.Request) {
 			rctx := chi.RouteContext(r.Context())
 			rctx.URLParams.Add("action", "delete")
@@ -385,6 +391,30 @@ func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {
 		WHERE s.project_id=$1 AND s.deleted_at IS NULL ORDER BY s.created_at`, p)
 }
 
+// getOverlay reports the project's private network: members, overlay IPs and each host's latest apply.
+func (s *Server) getOverlay(w http.ResponseWriter, r *http.Request) {
+	p := chi.URLParam(r, "project")
+	if !s.allow(w, r, "project", p, "view") {
+		return
+	}
+	proj, err := s.one(r.Context(), `SELECT id, overlay_kind AS kind, overlay_cidr::text AS cidr, overlay_generation AS generation FROM project WHERE id=$1`, p)
+	if err != nil {
+		writeErr(w, 404, "not_found", "project not found")
+		return
+	}
+	peers, err := s.rows(r.Context(), `SELECT o.service_id, s.display_name, host(o.overlay_ip) AS overlay_ip, o.endpoint, o.updated_at AS joined_at,
+		c.status AS last_apply_status, (c.payload->>'generation')::bigint AS applied_generation, c.updated_at AS last_apply_at
+		FROM overlay_peer o JOIN service s ON s.id=o.service_id LEFT JOIN agent a ON a.service_id=o.service_id
+		LEFT JOIN LATERAL (SELECT status, payload, updated_at FROM agent_command WHERE agent_id=a.id AND verb='overlay_apply' ORDER BY created_at DESC LIMIT 1) c ON true
+		WHERE o.project_id=$1 ORDER BY o.overlay_ip`, p)
+	if err != nil {
+		writeErr(w, 500, "internal", err.Error())
+		return
+	}
+	proj["peers"] = peers
+	writeJSON(w, 200, proj)
+}
+
 func (s *Server) getService(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "service")
 	if !s.allow(w, r, "service", id, "view") {
@@ -449,7 +479,8 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Provider == "" {
-		in.Provider = "byovm"
+		// Size IDs are "<provider>:<code>", so the size alone selects the provider.
+		in.Provider, _, _ = strings.Cut(in.Size, ":")
 	}
 	if in.SupportPlan == "" {
 		in.SupportPlan = "L1"
@@ -470,6 +501,18 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 		q := `SELECT tv.id::text FROM template_version tv JOIN template t ON t.id=tv.template_id WHERE t.slug=$1 AND tv.tested_at IS NOT NULL AND ($2='' OR tv.version=$2) ORDER BY tv.created_at DESC LIMIT 1`
 		if err := tx.QueryRow(r.Context(), q, in.Template, in.Version).Scan(&tvID); err != nil {
 			return fmt.Errorf("no tested version of template %q", in.Template)
+		}
+		var sizeOK, locked, inNigeria bool
+		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM size WHERE id=$1 AND provider_id=$2), o.residency_locked,
+			COALESCE((SELECT in_nigeria FROM provider WHERE id=$2), false)
+			FROM project pr JOIN organization o ON o.id=pr.org_id WHERE pr.id=$3`, in.Size, in.Provider, p).Scan(&sizeOK, &locked, &inNigeria); err != nil {
+			return err
+		}
+		if !sizeOK {
+			return fmt.Errorf("size %q is not offered by provider %q", in.Size, in.Provider)
+		}
+		if locked && !inNigeria {
+			return fmt.Errorf("residency-locked organizations cannot deploy to %s (no Nigerian region)", in.Provider)
 		}
 		if err := tx.QueryRow(r.Context(), `INSERT INTO service(project_id, template_version_id, display_name, provider_id, size_id, support_plan, env)
 			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id::text`, p, tvID, in.DisplayName, in.Provider, in.Size, in.SupportPlan, envJSON).Scan(&svcID); err != nil {
@@ -544,6 +587,68 @@ func (s *Server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.WF.StartAction(r.Context(), opID, id, action); err != nil {
+		s.failOperation(r.Context(), opID, "workflow start failed: "+err.Error())
+		writeErr(w, 503, "workflows_unavailable", err.Error())
+		return
+	}
+	s.writeOperation(w, r, opID, 202)
+}
+
+func (s *Server) listBackups(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "service")
+	if !s.allow(w, r, "service", id, "view") {
+		return
+	}
+	s.queryJSON(w, r, `SELECT id, kind, status, restic_snapshot_id, restored_from, bytes_added, error, started_at, finished_at
+		FROM backup_snapshot WHERE service_id=$1 ORDER BY started_at DESC LIMIT 100`, id)
+}
+
+func (s *Server) createBackup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "service")
+	s.backupOp(w, r, id, "operate", "service.backup", []byte(id), func(opID string) error {
+		_, err := s.WF.StartBackup(r.Context(), opID, id)
+		return err
+	})
+}
+
+// restoreBackup overwrites the service's current data, so it needs the destroy permission.
+func (s *Server) restoreBackup(w http.ResponseWriter, r *http.Request) {
+	id, b := chi.URLParam(r, "service"), chi.URLParam(r, "backup")
+	s.backupOp(w, r, id, "destroy", "service.restore", []byte(id+"|"+b), func(opID string) error {
+		_, err := s.WF.StartRestore(r.Context(), opID, id, b)
+		return err
+	})
+}
+
+func (s *Server) backupOp(w http.ResponseWriter, r *http.Request, id, perm, verb string, body []byte, start func(string) error) {
+	key := r.Header.Get("Idempotency-Key")
+	if !require(w, key != "", "Idempotency-Key header is required") || !s.allow(w, r, "service", id, perm) {
+		return
+	}
+	var opID string
+	var existing bool
+	err := s.tx(r.Context(), func(tx pgx.Tx) error {
+		var err error
+		if opID, existing, err = s.startOperation(r.Context(), tx, key, verb, "service", body); err != nil || existing {
+			return err
+		}
+		if _, err := tx.Exec(r.Context(), `UPDATE operation SET target_id=$2 WHERE id=$1`, opID, id); err != nil {
+			return err
+		}
+		return audit.Append(r.Context(), tx, audit.Event{Actor: userFrom(r.Context()).ID, Verb: verb, TargetKind: "service", TargetID: id, Detail: map[string]any{"operation_id": opID}})
+	})
+	switch {
+	case errors.Is(err, errIdempotencyConflict):
+		writeErr(w, 409, "idempotency_conflict", err.Error())
+		return
+	case err != nil:
+		writeErr(w, 422, "invalid_request", err.Error())
+		return
+	case existing:
+		s.writeOperation(w, r, opID, 200)
+		return
+	}
+	if err := start(opID); err != nil {
 		s.failOperation(r.Context(), opID, "workflow start failed: "+err.Error())
 		writeErr(w, 503, "workflows_unavailable", err.Error())
 		return

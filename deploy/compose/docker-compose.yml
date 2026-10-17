@@ -68,6 +68,15 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
 
+  backups:
+    # restic REST server: off-host backup target. Repositories are encrypted client-side with a
+    # per-service password, so this server never sees plaintext. HTTP basic auth is on: with no user
+    # every request gets 401. Create the user with scripts/backup-repo-user.sh.
+    image: restic/rest-server:0.13.0
+    ports: ["8000:8000"]
+    volumes: ["backupdata:/data"]
+
 volumes:
   pgdata: {}
   tbdata: {}
+  backupdata: {}

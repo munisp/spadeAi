@@ -4,11 +4,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/client"
@@ -157,12 +160,53 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 			return "available", ""
 		})
 	}
-	for _, p := range []string{"hetzner", "aws", "proxmox", "openstack"} {
+	for _, p := range []string{"aws", "proxmox", "openstack"} {
 		p := p
 		c.Register("provider."+p, func(context.Context) (string, string) { return "unavailable", "driver not implemented" })
 	}
+	for _, d := range registry.FromEnv() {
+		d := d
+		c.Register("provider."+d.Name(), func(ctx context.Context) (string, string) {
+			if !d.Configured() {
+				return "unavailable", d.TokenEnv() + " not configured"
+			}
+			if err := d.Ping(ctx); err != nil {
+				return "degraded", err.Error()
+			}
+			return "available", "servers are created outside Nigeria (no NG region); residency-locked orgs cannot use it"
+		})
+	}
 	c.Register("provider.byovm", func(context.Context) (string, string) { return "available", "" })
-	c.Register("overlay.wireguard", func(context.Context) (string, string) { return "unavailable", "overlay controller not implemented" })
-	c.Register("overlay.nebula", func(context.Context) (string, string) { return "unavailable", "overlay controller not implemented" })
-	c.Register("backups", func(context.Context) (string, string) { return "unavailable", "backup orchestration not implemented" })
+	c.Register("overlay.wireguard", func(context.Context) (string, string) {
+		return "available", "hosts need the wireguard kernel module and wireguard-tools"
+	})
+	c.Register("overlay.nebula", func(context.Context) (string, string) {
+		if _, err := exec.LookPath(config.Get("NEBULA_CERT", "nebula-cert")); err != nil {
+			return "unavailable", "nebula-cert not installed on the control plane"
+		}
+		if _, err := os.Stat(config.KEKFile()); err != nil {
+			return "unavailable", "KEK not present (SPADE_KEK_FILE); CA keys cannot be sealed"
+		}
+		return "available", "hosts need the nebula binary"
+	})
+	c.Register("backups", func(ctx context.Context) (string, string) {
+		if _, err := os.Stat(config.KEKFile()); err != nil {
+			return "unavailable", "KEK not present (SPADE_KEK_FILE); repository passwords cannot be sealed"
+		}
+		repo := os.Getenv("SPADE_BACKUP_REPO")
+		if repo == "" {
+			return "unavailable", "SPADE_BACKUP_REPO not configured"
+		}
+		u := strings.TrimPrefix(repo, "rest:")
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+		if err != nil {
+			return "unavailable", "backup repository unreachable: " + err.Error()
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "unavailable", "backup repository rejected the credentials in SPADE_BACKUP_REPO"
+		}
+		return "available", "restic REST repository; hosts need restic"
+	})
 }
