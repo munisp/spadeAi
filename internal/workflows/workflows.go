@@ -72,6 +72,10 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 		dctx = short(dctx)
 		_ = workflow.ExecuteActivity(dctx, a.VoidHold, serviceID).Get(dctx, nil)
 		reason := fmt.Sprintf("%s: %v", stage, cause)
+		// A failed deploy must not leave a provider server running (and billing the customer's account).
+		if err := workflow.ExecuteActivity(dctx, a.Deprovision, serviceID).Get(dctx, nil); err != nil {
+			reason += "; cleanup failed, provider server may still exist: " + err.Error()
+		}
 		_ = workflow.ExecuteActivity(dctx, a.SetState, serviceID, "failed", reason).Get(dctx, nil)
 		_ = workflow.ExecuteActivity(dctx, a.MarkOperation, opID, "failed", "", reason, nil).Get(dctx, nil)
 		return cause
@@ -192,6 +196,13 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 		var projectID string
 		if err := workflow.ExecuteActivity(sctx, a.OverlayRemove, serviceID).Get(ctx, &projectID); err == nil && projectID != "" {
 			_ = syncOverlay(ctx, a, projectID, "")
+		}
+		// Containers are down; a server we failed to delete would keep costing the customer, so the
+		// service stays visible as stopped with the error instead of reporting deleted.
+		if err := workflow.ExecuteActivity(sctx, a.Deprovision, serviceID).Get(ctx, nil); err != nil {
+			_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, "stopped", "deprovision failed: "+err.Error()).Get(ctx, nil)
+			_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
+			return err
 		}
 	}
 	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, final, "").Get(ctx, nil); err != nil {

@@ -58,3 +58,15 @@ All services read `SPADE_DATABASE_URL`, not the generic `DATABASE_URL`, so they 
 See [docs/READINESS.md](docs/READINESS.md) for an honest production-readiness assessment.
 
 The local backup repository requires a user: run `scripts/backup-repo-user.sh` after `docker compose up` and export the printed `SPADE_BACKUP_REPO` values (one for the gateway, one for the API probe). The password is generated locally and never committed. That local repo is plain HTTP, so the gateway refuses to send credentials to it unless `SPADE_BACKUP_ALLOW_PLAINTEXT=1` (local dev only); production repositories must be `rest:https://`.
+
+### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode)
+All API providers share one adapter (`internal/providers/cloud`): servers are tagged with the service and enrolment attempt, so a retried deploy never creates a second server, stale attempts are removed, and deleting a service removes every server it owns. First boot (cloud-init, Ubuntu 24.04) locks the root password, installs Docker + Compose, WireGuard tools, restic and a pinned Nebula, then runs the embedded agent installer, which checks the gateway CA pin before downloading anything.
+
+| Provider | Token (set on `spade-api` and `spade-worker`) | Region variable (default) | Sizes |
+|---|---|---|---|
+| Hetzner Cloud | `SPADE_HETZNER_TOKEN` | `SPADE_HETZNER_LOCATION` (`fsn1`) | `hetzner:CX22`, `CX32`, `CX42` |
+| DigitalOcean | `SPADE_DIGITALOCEAN_TOKEN` | `SPADE_DIGITALOCEAN_REGION` (`lon1`) | `digitalocean:s-1vcpu-2gb`, `s-2vcpu-4gb`, `s-4vcpu-8gb` |
+| Vultr | `SPADE_VULTR_TOKEN` | `SPADE_VULTR_REGION` (`jnb`, Johannesburg) | `vultr:vc2-1c-2gb`, `vc2-2c-4gb`, `vc2-4c-8gb` |
+| Akamai Cloud (Linode) | `SPADE_LINODE_TOKEN` | `SPADE_LINODE_REGION` (`gb-lon`, must support Metadata) | `linode:g6-standard-1`, `g6-standard-2`, `g6-standard-4` |
+
+`SPADE_<PROVIDER>_API` overrides the API base URL; `SPADE_VULTR_OS_ID` overrides Vultr's Ubuntu 24.04 image id (2284). `GATEWAY_PUBLIC_URL` must be an internet-reachable `https://host[:port]` because the new server enrols itself. Without a token a provider reports `unavailable` in `/v1/capabilities` and its deploys fail closed. None of these providers has a Nigerian region, so residency-locked organisations are refused (`provider.in_nigeria`).

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,8 +17,10 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/munisp/spadeai/internal/audit"
+	"github.com/munisp/spadeai/internal/gateway"
 	"github.com/munisp/spadeai/internal/ledger"
 	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/providers/cloud"
 	"github.com/munisp/spadeai/internal/secrets"
 )
 
@@ -30,6 +33,8 @@ type Activities struct {
 	// GatewayURL / CAPin are embedded in the BYOVM bootstrap command shown to the user.
 	GatewayURL string
 	CAPin      string
+	// Clouds holds the API provider drivers by provider id; one without its token fails deploys closed.
+	Clouds map[string]cloud.Driver
 }
 
 func nonRetryable(format string, args ...any) error {
@@ -153,7 +158,11 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 	if err != nil {
 		return nil, err
 	}
-	if s.Provider != "byovm" {
+	d := a.Clouds[s.Provider]
+	switch {
+	case d != nil && !d.Configured():
+		return nil, nonRetryable("provider %s unavailable: %s not configured", s.Provider, d.TokenEnv())
+	case d == nil && s.Provider != "byovm":
 		return nil, nonRetryable("provider %q has no driver configured", s.Provider)
 	}
 	if a.GatewayURL == "" || a.CAPin == "" {
@@ -173,7 +182,70 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 		return nil, err
 	}
 	cmd := fmt.Sprintf("curl -fsSL --insecure %s/agent/v1/install.sh | sudo SPADE_GATEWAY=%s SPADE_CA_SHA256=%s SPADE_ENROL_TOKEN=%s sh", a.GatewayURL, a.GatewayURL, a.CAPin, token)
+	if d != nil {
+		return a.provisionCloud(ctx, d, serviceID, token, hex.EncodeToString(sum[:8]), exp)
+	}
 	return &ProvisionResult{Bootstrap: cmd, EnrolExpiresAt: exp}, nil
+}
+
+// Host dependencies on a stock ubuntu-24.04 image: Docker + Compose for stacks, WireGuard tools and
+// pinned Nebula for overlays, restic for backups.
+var (
+	safeGatewayURL = regexp.MustCompile(`^https://[A-Za-z0-9.\-]+(:[0-9]{1,5})?(/[A-Za-z0-9._\-/]*)?$`)
+	hexOnly        = regexp.MustCompile(`^[0-9a-f]+$`)
+)
+
+var hostPackages = []string{"docker.io", "docker-compose-v2", "wireguard-tools", "restic", "curl", "openssl"}
+
+const nebulaInstall = `curl -fsSL -o /tmp/nebula.tgz https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz && ` +
+	`echo "af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71  /tmp/nebula.tgz" | sha256sum -c - && ` +
+	`tar -xzf /tmp/nebula.tgz -C /usr/local/bin nebula nebula-cert && rm /tmp/nebula.tgz`
+
+// provisionCloud creates the server whose cloud-init installs host dependencies and runs the embedded
+// agent installer. The attempt tag ties the server to this enrolment token.
+func (a *Activities) provisionCloud(ctx context.Context, d cloud.Driver, serviceID, token, attempt string, exp time.Time) (*ProvisionResult, error) {
+	var code string
+	if err := a.Pool.QueryRow(ctx, `SELECT z.code FROM service s JOIN size z ON z.id=s.size_id WHERE s.id=$1`, serviceID).Scan(&code); err != nil {
+		return nil, err
+	}
+	// Reconcile by tag on every attempt, whether or not provider_ref was recorded.
+	if err := cloud.DeleteOthers(ctx, d, serviceID, attempt); err != nil {
+		return nil, err
+	}
+	// Values are interpolated into a root shell command, so only accept URL/hex characters.
+	if !safeGatewayURL.MatchString(a.GatewayURL) || !hexOnly.MatchString(a.CAPin) || !hexOnly.MatchString(token) {
+		return nil, nonRetryable("GATEWAY_PUBLIC_URL must be https://host[:port][/path] with no quotes or spaces, and the CA pin hex")
+	}
+	run := fmt.Sprintf("SPADE_GATEWAY='%s' SPADE_CA_SHA256='%s' SPADE_ENROL_TOKEN='%s' sh /opt/spade/install.sh", a.GatewayURL, a.CAPin, token)
+	boot := cloud.Boot{Packages: hostPackages, Files: map[string]string{"/opt/spade/install.sh": gateway.InstallScript()},
+		Pre: []string{"passwd -l root", "systemctl enable --now docker", nebulaInstall}, Run: run}
+	srv, _, err := cloud.Ensure(ctx, d, cloud.CreateOpts{ServiceID: serviceID, Attempt: attempt, Size: code, UserData: cloud.CloudInit(boot)})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.Pool.Exec(ctx, `UPDATE service SET provider_ref=$2 WHERE id=$1`, serviceID, srv.ID); err != nil {
+		return nil, err
+	}
+	return &ProvisionResult{Bootstrap: fmt.Sprintf("%s server %s (%s) installs the agent via cloud-init", d.Name(), srv.Name, srv.IPv4), EnrolExpiresAt: exp}, nil
+}
+
+// Deprovision deletes provider infrastructure for API providers; BYOVM hosts belong to the customer.
+func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
+	s, err := a.info(ctx, serviceID)
+	if err != nil {
+		return err
+	}
+	if d := a.Clouds[s.Provider]; d != nil {
+		if !d.Configured() {
+			return nonRetryable("%s server for %s not deleted: %s not configured", s.Provider, serviceID, d.TokenEnv())
+		}
+		if _, err := cloud.DeleteAll(ctx, d, serviceID); err != nil {
+			return err
+		}
+	}
+	// The host is gone or no longer managed: its agent certificate and any enrolment token stop working.
+	_, err = a.Pool.Exec(ctx, `UPDATE agent SET cert_fingerprint=NULL, enrol_token_sha256=NULL, enrol_expires_at=NULL WHERE service_id=$1`, serviceID)
+	return err
 }
 
 func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {

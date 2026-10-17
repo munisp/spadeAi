@@ -69,4 +69,15 @@ echo "PASS arrears: settled oldest-first and org resumed"
 
 [ "$(curl -sf "${H[@]}" "$API/v1/audit-events/verify" | j "d['intact']")" = True ] || fail "audit chain broken"
 echo "PASS audit chain intact"
+# Cloud providers: residency-locked orgs are refused, and a provider without a token fails closed.
+sql "UPDATE organization SET residency_locked=true WHERE id='$ORG'" >/dev/null
+RES=$(curl -s "${H[@]}" -H "Idempotency-Key: $RUN-res" -d '{"template":"whoami","display_name":"offshore","size":"digitalocean:s-1vcpu-2gb"}' "$API/v1/projects/$PRJ/services")
+echo "$RES" | grep -q "residency-locked" || fail "residency-locked org allowed onto digitalocean: $RES"
+sql "UPDATE organization SET residency_locked=false WHERE id='$ORG'" >/dev/null
+OP3=$(curl -sf "${H[@]}" -H "Idempotency-Key: $RUN-do" -d '{"template":"whoami","display_name":"do","size":"digitalocean:s-1vcpu-2gb"}' "$API/v1/projects/$PRJ/services" | j "d['id']")
+for _ in $(seq 60); do
+  O3=$(curl -sf "${H[@]}" "$API/v1/operations/$OP3"); [ "$(echo "$O3" | j "d['status']")" = failed ] && break; sleep 1
+done
+echo "$O3" | grep -q "SPADE_DIGITALOCEAN_TOKEN not configured" || fail "unconfigured provider did not fail closed: $O3"
+echo "PASS providers: residency-locked org refused offshore cloud; tokenless DigitalOcean deploy failed closed"
 echo "E2E OK"

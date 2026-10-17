@@ -1,6 +1,6 @@
 # Production readiness
 
-**Overall: about 45/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM, plus per-project private networks (WireGuard and Nebula) between hosts and encrypted off-host backups with restore. It is not a production platform yet.
+**Overall: about 49/100.** This is a working vertical slice: deploy, run, meter, bill, suspend and resume, done end to end on BYOVM (Hetzner, DigitalOcean, Vultr and Akamai/Linode drivers added on a shared cloud adapter, none yet live-tested), plus per-project private networks (WireGuard and Nebula) between hosts and encrypted off-host backups with restore. It is not a production platform yet.
 
 ## Verified locally (scripts/e2e.sh plus unit tests)
 | Area | Evidence |
@@ -19,7 +19,9 @@
 ## Unavailable or not implemented (reported honestly as `unavailable`)
 | Area | State |
 |---|---|
-| Cloud drivers (Hetzner, AWS, Proxmox, OpenStack) | Not implemented. BYOVM only |
+| Hetzner Cloud driver | Implemented: servers labelled `spade-service`/`spade-attempt` so retries never double-create, cloud-init installs the agent, delete removes every server for the service and a failed delete leaves the service `stopped` (not `deleted`). Capability is `unavailable` without `SPADE_HETZNER_TOKEN`. First-boot cloud-init installs Docker + Compose, WireGuard tools, restic and pinned Nebula 1.9.5 (sha256-checked), and runs the agent installer embedded in user data (no `curl --insecure` script fetch; the CA pin is checked before anything else is downloaded). Every attempt deletes servers from other attempts; a failed deploy deprovisions; delete and failed deploys revoke the agent certificate. Unit-tested against a fake Hetzner API only; **not yet run against a live Hetzner account**. No Nigerian region, so residency-locked orgs are refused |
+| Cloud adapter: DigitalOcean, Vultr, Akamai/Linode | Implemented on `internal/providers/cloud` with Hetzner: tag/label-based idempotent create per attempt, reconciliation, delete-all, shared cloud-init. Each driver passes the same contract test (`cloudtest.Contract`) against a fake of its API, including pagination and bad/missing tokens. **Not verified against any live account**; capability is `unavailable` without its token. Residency-locked orgs are refused (no Nigerian region). Vultr OS id and Linode Metadata regions are from public docs and need confirming on first live run |
+| Cloud drivers (AWS, Proxmox, OpenStack) | Not implemented; capability reports `unavailable` |
 | Paystack / Flutterwave | Code and tests done; **no credentials configured**, so these report unavailable. Not yet verified against the live sandbox |
 | AI DevOps | Router and policy enforcement are unit-tested; no LLM backend is configured, so `/healthz` returns 503 |
 | Mobile app | Type-checks only; not run on a device or emulator |
