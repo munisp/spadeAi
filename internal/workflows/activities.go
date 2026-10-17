@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +20,7 @@ import (
 	"github.com/munisp/spadeai/internal/audit"
 	"github.com/munisp/spadeai/internal/ledger"
 	"github.com/munisp/spadeai/internal/overlay"
+	"github.com/munisp/spadeai/internal/providers/hetzner"
 	"github.com/munisp/spadeai/internal/secrets"
 )
 
@@ -30,6 +33,9 @@ type Activities struct {
 	// GatewayURL / CAPin are embedded in the BYOVM bootstrap command shown to the user.
 	GatewayURL string
 	CAPin      string
+	// Hetzner is nil/tokenless unless SPADE_HETZNER_TOKEN is set; hetzner deploys then fail closed.
+	Hetzner         *hetzner.Client
+	HetznerLocation string
 }
 
 func nonRetryable(format string, args ...any) error {
@@ -153,7 +159,10 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 	if err != nil {
 		return nil, err
 	}
-	if s.Provider != "byovm" {
+	switch {
+	case s.Provider == "hetzner" && (a.Hetzner == nil || a.Hetzner.Token == ""):
+		return nil, nonRetryable("provider hetzner unavailable: SPADE_HETZNER_TOKEN not configured")
+	case s.Provider != "byovm" && s.Provider != "hetzner":
 		return nil, nonRetryable("provider %q has no driver configured", s.Provider)
 	}
 	if a.GatewayURL == "" || a.CAPin == "" {
@@ -173,7 +182,50 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 		return nil, err
 	}
 	cmd := fmt.Sprintf("curl -fsSL --insecure %s/agent/v1/install.sh | sudo SPADE_GATEWAY=%s SPADE_CA_SHA256=%s SPADE_ENROL_TOKEN=%s sh", a.GatewayURL, a.GatewayURL, a.CAPin, token)
+	if s.Provider == "hetzner" {
+		return a.provisionHetzner(ctx, serviceID, cmd, hex.EncodeToString(sum[:8]), exp)
+	}
 	return &ProvisionResult{Bootstrap: cmd, EnrolExpiresAt: exp}, nil
+}
+
+// provisionHetzner creates the server whose cloud-init runs the bootstrap. The attempt label ties the
+// server to this enrolment token; servers from earlier attempts (stale tokens) are deleted first.
+func (a *Activities) provisionHetzner(ctx context.Context, serviceID, bootstrap, attempt string, exp time.Time) (*ProvisionResult, error) {
+	var code, ref string
+	if err := a.Pool.QueryRow(ctx, `SELECT z.code, coalesce(s.provider_ref,'') FROM service s JOIN size z ON z.id=s.size_id WHERE s.id=$1`, serviceID).Scan(&code, &ref); err != nil {
+		return nil, err
+	}
+	if ref != "" {
+		if _, err := a.Hetzner.Delete(ctx, serviceID); err != nil {
+			return nil, err
+		}
+	}
+	loc := a.HetznerLocation
+	if loc == "" {
+		loc = "fsn1"
+	}
+	srv, _, err := a.Hetzner.Ensure(ctx, hetzner.CreateOpts{ServiceID: serviceID, Attempt: attempt, ServerType: strings.ToLower(code),
+		Location: loc, Image: "ubuntu-24.04", UserData: hetzner.CloudInit(bootstrap)})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.Pool.Exec(ctx, `UPDATE service SET provider_ref=$2 WHERE id=$1`, serviceID, strconv.FormatInt(srv.ID, 10)); err != nil {
+		return nil, err
+	}
+	return &ProvisionResult{Bootstrap: fmt.Sprintf("hetzner server %s (%s) installs the agent via cloud-init", srv.Name, srv.IPv4), EnrolExpiresAt: exp}, nil
+}
+
+// Deprovision deletes provider infrastructure for API providers; BYOVM hosts belong to the customer.
+func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
+	s, err := a.info(ctx, serviceID)
+	if err != nil || s.Provider != "hetzner" {
+		return err
+	}
+	if a.Hetzner == nil || a.Hetzner.Token == "" {
+		return nonRetryable("hetzner server for %s not deleted: SPADE_HETZNER_TOKEN not configured", serviceID)
+	}
+	_, err = a.Hetzner.Delete(ctx, serviceID)
+	return err
 }
 
 func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {

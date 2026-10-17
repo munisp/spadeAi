@@ -192,6 +192,13 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 		if err := workflow.ExecuteActivity(sctx, a.OverlayRemove, serviceID).Get(ctx, &projectID); err == nil && projectID != "" {
 			_ = syncOverlay(ctx, a, projectID, "")
 		}
+		// Containers are down; a server we failed to delete would keep costing the customer, so the
+		// service stays visible as stopped with the error instead of reporting deleted.
+		if err := workflow.ExecuteActivity(sctx, a.Deprovision, serviceID).Get(ctx, nil); err != nil {
+			_ = workflow.ExecuteActivity(sctx, a.SetState, serviceID, "stopped", "deprovision failed: "+err.Error()).Get(ctx, nil)
+			_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
+			return err
+		}
 	}
 	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, final, "").Get(ctx, nil); err != nil {
 		return err

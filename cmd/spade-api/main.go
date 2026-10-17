@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/munisp/spadeai/internal/providers/hetzner"
 	"log/slog"
 	"net"
 	"net/http"
@@ -159,10 +160,20 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 			return "available", ""
 		})
 	}
-	for _, p := range []string{"hetzner", "aws", "proxmox", "openstack"} {
+	for _, p := range []string{"aws", "proxmox", "openstack"} {
 		p := p
 		c.Register("provider."+p, func(context.Context) (string, string) { return "unavailable", "driver not implemented" })
 	}
+	hz := &hetzner.Client{Token: os.Getenv("SPADE_HETZNER_TOKEN"), BaseURL: os.Getenv("SPADE_HETZNER_API")}
+	c.Register("provider.hetzner", func(ctx context.Context) (string, string) {
+		if hz.Token == "" {
+			return "unavailable", "SPADE_HETZNER_TOKEN not configured"
+		}
+		if err := hz.Ping(ctx); err != nil {
+			return "degraded", err.Error()
+		}
+		return "available", "servers are created outside Nigeria (no NG region); residency-locked orgs cannot use it"
+	})
 	c.Register("provider.byovm", func(context.Context) (string, string) { return "available", "" })
 	c.Register("overlay.wireguard", func(context.Context) (string, string) {
 		return "available", "hosts need the wireguard kernel module and wireguard-tools"

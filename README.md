@@ -56,3 +56,6 @@ The signed payment-credit hook (`/internal/payments/verified`) is served only on
 All services read `SPADE_DATABASE_URL`, not the generic `DATABASE_URL`, so they never pick up another project's database by accident. The local defaults in `internal/config` are for development only.
 
 See [docs/READINESS.md](docs/READINESS.md) for an honest production-readiness assessment.
+
+### Hetzner Cloud
+Set `SPADE_HETZNER_TOKEN` (a Hetzner Cloud project API token) on `spade-api` and `spade-worker`; optional `SPADE_HETZNER_LOCATION` (default `fsn1`). Deploy with a `hetzner:CX22|CX32|CX42` size. The gateway URL in `GATEWAY_URL` must be reachable from the internet, because the server's cloud-init runs the agent bootstrap. Without a token, `provider.hetzner` reports `unavailable` and Hetzner deploys fail closed.

@@ -60,7 +60,9 @@ export function App() {
   };
   const deploy = async (t: Template) => {
     const name = prompt(`Name for ${t.name}`, t.slug); if (!name) return;
-    const op = await call<{ id: string }>(`/v1/projects/${project!.id}/services`, { method: "POST", idempotent: true, body: JSON.stringify({ template: t.slug, display_name: name, size: "byovm:SMALL-1C-2G" }) });
+    const hetzner = caps.find(c => c.component === "provider.hetzner")?.status === "available";
+    const size = prompt(`Size: byovm:SMALL-1C-2G | byovm:MEDIUM-2C-4G | byovm:LARGE-4C-8G${hetzner ? " | hetzner:CX22 | hetzner:CX32 | hetzner:CX42" : " (Hetzner unavailable)"}`, "byovm:SMALL-1C-2G"); if (!size) return;
+    const op = await call<{ id: string }>(`/v1/projects/${project!.id}/services`, { method: "POST", idempotent: true, body: JSON.stringify({ template: t.slug, display_name: name, size }) });
     for (let i = 0; i < 30; i++) {
       const o = await call<{ status: string; response?: { bootstrap?: string }; error?: string }>(`/v1/operations/${op.id}`);
       if (o.response?.bootstrap) { setBootstrap(o.response.bootstrap); break; }
