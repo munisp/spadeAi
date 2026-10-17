@@ -1,0 +1,53 @@
+{
+  "realm": "spadeai",
+  "enabled": true,
+  "registrationAllowed": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "accessTokenLifespan": 900,
+  "requiredActions": [],
+  "clients": [
+    {
+      "clientId": "spade-pwa",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:5173/*"],
+      "webOrigins": ["http://localhost:5173"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {"name": "aud-spade-api", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+         "config": {"included.client.audience": "spade-api", "access.token.claim": "true", "id.token.claim": "false"}}
+      ]
+    },
+    {
+      "clientId": "spade-mobile",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["spadeai://auth/*", "exp://*"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {"name": "aud-spade-api", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+         "config": {"included.client.audience": "spade-api", "access.token.claim": "true", "id.token.claim": "false"}}
+      ]
+    },
+    {
+      "clientId": "spade-cli",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "protocolMappers": [
+        {"name": "aud-spade-api", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+         "config": {"included.client.audience": "spade-api", "access.token.claim": "true", "id.token.claim": "false"}}
+      ]
+    },
+    {"clientId": "spade-api", "publicClient": false, "bearerOnly": true, "secret": "unused-bearer-only"}
+  ],
+  "users": [
+    {
+      "username": "dev@spadeai.local", "email": "dev@spadeai.local", "emailVerified": true, "enabled": true,
+      "firstName": "Dev", "lastName": "User",
+      "credentials": [{"type": "password", "value": "dev-password", "temporary": false}]
+    }
+  ]
+}
