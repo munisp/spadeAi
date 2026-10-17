@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Backup/restore check on a docker-in-docker "VM": deploy static-site, write v1, back up (restic, encrypted,
 # off-host REST repo), overwrite with v2 plus an extra file, restore, expect exactly v1 again.
-# Needs api/worker/gateway running; gateway with SPADE_BACKUP_REPO=rest:http://172.31.250.1:8000 and
-# GATEWAY_HOSTS including 172.31.250.1; compose `backups` service up.
+# Also checks tenant isolation: each service has its own append-only, private-repo login, and retention
+# runs from the control plane. Needs api/worker/gateway running with the settings printed by
+# scripts/backup-repo-user.sh (gateway SPADE_BACKUP_REPO=rest:http://172.31.250.1:8000, GATEWAY_HOSTS
+# including 172.31.250.1); compose `backups` and `backups-admin` up.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 API=${API:-http://localhost:8080}
@@ -56,6 +58,28 @@ SNAP=$(curl -sf "${H[@]}" "$API/v1/services/$SVC/backups" | j "[b for b in d['it
 [ "$(page)" = v1 ] || fail "app not serving after quiesced backup"
 echo "PASS backup: encrypted restic snapshot $SNAP stored off-host, app restarted"
 
+U="s-$SVC"
+HT=${SPADE_BACKUP_HTPASSWD:-.spade/backup-auth/htpasswd}
+grep -q "^$U:\$2" "$HT" || fail "no bcrypt login for $U in $HT"
+docker compose -f deploy/compose/docker-compose.yml exec -T backups test -f "/data/$U/config" || fail "repository not under /$U"
+[ "$(sql "SELECT status FROM operation WHERE id='$BOP'")" = succeeded ] || fail "backup op not succeeded"
+[ "$(sql "SELECT coalesce(response->>'prune_error','') FROM operation WHERE id='$BOP'")" = "" ] || fail "retention failed: $(sql "SELECT response->>'prune_error' FROM operation WHERE id='$BOP'")"
+code() { docker exec "$V" curl -s -o /dev/null -w '%{http_code}' "$@"; }
+[ "$(code http://172.31.250.1:8000/$U/config)" = 401 ] || fail "anonymous request to the tenant repository was not refused"
+[ "$(code --max-time 3 http://172.31.250.1:8001/ || true)" = 000 ] || fail "retention endpoint reachable from a tenant host"
+# A second tenant login (as another service would get) must not reach this service's repository, and a
+# tenant login cannot delete snapshots even in its own repository.
+OTHER="s-$(python3 -c 'import uuid;print(uuid.uuid4())')"; OPW=$(key)
+docker run --rm httpd:2.4-alpine htpasswd -nbB "$OTHER" "$OPW" >> "$HT"
+for _ in $(seq 40); do [ "$(code -u "$OTHER:$OPW" -X POST "http://172.31.250.1:8000/$OTHER/?create=true")" = 200 ] && break; sleep 1; done
+[ "$(code -u "$OTHER:$OPW" -X POST "http://172.31.250.1:8000/$OTHER/?create=true")" = 200 ] || fail "test login never accepted"
+[ "$(code -u "$OTHER:$OPW" "http://172.31.250.1:8000/$U/config")" = 401 ] || fail "another tenant's login can read $U"
+[ "$(code -u "$OTHER:$OPW" -X DELETE "http://172.31.250.1:8000/$U/snapshots/$SNAP")" = 401 ] || fail "another tenant's login can delete in $U"
+docker exec "$V" sh -c "printf x | curl -s -o /dev/null -u '$OTHER:$OPW' -X POST --data-binary @- http://172.31.250.1:8000/$OTHER/keys/0000000000000000000000000000000000000000000000000000000000000000" >/dev/null
+[ "$(code -u "$OTHER:$OPW" -X DELETE "http://172.31.250.1:8000/$OTHER/keys/0000000000000000000000000000000000000000000000000000000000000000")" = 403 ] || fail "append-only: a tenant login could delete from its own repository"
+sed -i "/^$OTHER:/d" "$HT"
+echo "PASS isolation: per-service login, repository under /$U, other tenants refused, deletes refused (append-only), retention endpoint unreachable from hosts"
+
 docker exec "$V" docker exec "$C" sh -c 'echo v2 > /usr/share/nginx/html/index.html; echo junk > /usr/share/nginx/html/extra.txt'
 [ "$(page)" = v2 ] || fail "could not write v2"
 ROP=$(curl -sf "${H[@]}" -X POST -H "Idempotency-Key: $(key)" "$API/v1/services/$SVC/backups/$BID/restore" | j "d['id']")
@@ -82,4 +106,9 @@ fi
 [ "$(sql "SELECT count(*) FROM agent_command WHERE verb LIKE 'backup_%' AND (payload ? 'restic' OR payload::text ILIKE '%password%')")" = 0 ] \
   || fail "backup credentials were persisted in the command queue"
 echo "PASS backup credentials never stored in agent_command"
+
+DOP=$(curl -sf "${H[@]}" -X DELETE -H "Idempotency-Key: $(key)" "$API/v1/services/$SVC" | j "d['id']")
+wait_op "$DOP"
+grep -q "^$U:" "$HT" && fail "backup login for deleted service $U still present"
+echo "PASS deleting the service revokes its backup login"
 echo "BACKUP E2E OK"

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"github.com/munisp/spadeai/internal/api"
 	"github.com/munisp/spadeai/internal/auth"
 	"github.com/munisp/spadeai/internal/authz"
+	"github.com/munisp/spadeai/internal/backups"
 	"github.com/munisp/spadeai/internal/capability"
 	"github.com/munisp/spadeai/internal/config"
 	"github.com/munisp/spadeai/internal/ledger"
@@ -203,16 +205,40 @@ func registerProbes(c *capability.Registry, pgPing func(context.Context) error, 
 		if repo == "" {
 			return "unavailable", "SPADE_BACKUP_REPO not configured"
 		}
-		u := strings.TrimPrefix(repo, "rest:")
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+		if _, err := backups.Repo(repo, "s-00000000-0000-0000-0000-000000000000", "probe", os.Getenv("SPADE_BACKUP_ALLOW_PLAINTEXT") == "1"); err != nil {
+			return "unavailable", "SPADE_BACKUP_REPO: " + err.Error()
+		}
+		hc := &http.Client{Timeout: 3 * time.Second}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimPrefix(repo, "rest:"), nil)
+		resp, err := hc.Do(req)
 		if err != nil {
 			return "unavailable", "backup repository unreachable: " + err.Error()
 		}
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return "unavailable", "backup repository rejected the credentials in SPADE_BACKUP_REPO"
+		if resp.StatusCode != http.StatusUnauthorized {
+			return "degraded", fmt.Sprintf("backup repository answered an anonymous request with HTTP %d; it must require logins (htpasswd)", resp.StatusCode)
 		}
-		return "available", "restic REST repository; hosts need restic"
+		admin := os.Getenv("SPADE_BACKUP_ADMIN_REPO")
+		if admin == "" {
+			return "degraded", "SPADE_BACKUP_ADMIN_REPO not configured: backups run but retention (pruning) cannot"
+		}
+		au, err := url.Parse(strings.TrimPrefix(admin, "rest:"))
+		if err != nil || au.User == nil {
+			return "degraded", "SPADE_BACKUP_ADMIN_REPO must be rest:http(s)://user:password@host[:port]"
+		}
+		apw, _ := au.User.Password()
+		auser := au.User.Username()
+		au.User = nil
+		req, _ = http.NewRequestWithContext(ctx, http.MethodGet, au.String(), nil)
+		req.SetBasicAuth(auser, apw)
+		resp, err = hc.Do(req)
+		if err != nil {
+			return "degraded", "backup admin endpoint unreachable: retention cannot run: " + err.Error()
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "degraded", "backup admin endpoint rejected SPADE_BACKUP_ADMIN_REPO credentials: retention cannot run"
+		}
+		return "available", "restic REST repository: per-service append-only logins; retention via admin endpoint"
 	})
 }

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/munisp/spadeai/internal/backups"
+	"net/http"
 	"regexp"
 	"time"
 
@@ -35,6 +37,11 @@ type Activities struct {
 	CAPin      string
 	// Clouds holds the API provider drivers by provider id; one without its token fails deploys closed.
 	Clouds map[string]cloud.Driver
+	// Backup logins: Htpasswd holds per-service logins for the tenant repository server (BackupRepo, as
+	// reached from the worker); Pruner applies retention through the admin endpoint.
+	Htpasswd   *backups.Htpasswd
+	BackupRepo string
+	Pruner     *backups.Pruner
 }
 
 func nonRetryable(format string, args ...any) error {
@@ -244,8 +251,16 @@ func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
 		}
 	}
 	// The host is gone or no longer managed: its agent certificate and any enrolment token stop working.
-	_, err = a.Pool.Exec(ctx, `UPDATE agent SET cert_fingerprint=NULL, enrol_token_sha256=NULL, enrol_expires_at=NULL WHERE service_id=$1`, serviceID)
-	return err
+	if _, err = a.Pool.Exec(ctx, `UPDATE agent SET cert_fingerprint=NULL, enrol_token_sha256=NULL, enrol_expires_at=NULL WHERE service_id=$1`, serviceID); err != nil {
+		return err
+	}
+	// Its backup login stops working too; the snapshots stay for the retention period.
+	if a.Htpasswd != nil {
+		if user, err := backups.User(serviceID); err == nil {
+			return a.Htpasswd.Remove(user)
+		}
+	}
+	return nil
 }
 
 func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {
@@ -447,20 +462,80 @@ func (a *Activities) OverlayRemove(ctx context.Context, serviceID string) (strin
 	return a.Overlay.Remove(ctx, serviceID)
 }
 
-// EnsureBackupConfig creates the service's restic password (random, sealed with the KEK) on first use.
+// EnsureBackupConfig creates the service's restic password and its own repository login (both random,
+// sealed with the KEK) on first use, and makes sure the tenant server accepts that login.
 func (a *Activities) EnsureBackupConfig(ctx context.Context, serviceID string) error {
 	if a.KEK == nil {
 		return nonRetryable("backups unavailable: KEK not configured")
 	}
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return err
+	if a.Htpasswd == nil || a.BackupRepo == "" {
+		return nonRetryable("backups unavailable: SPADE_BACKUP_HTPASSWD or SPADE_BACKUP_REPO not configured on the worker")
 	}
-	sealed, err := a.KEK.Seal([]byte(hex.EncodeToString(raw)), "backup:"+serviceID)
+	user, err := backups.User(serviceID)
+	if err != nil {
+		return nonRetryable("%v", err)
+	}
+	pw, err := randomSealed(a.KEK, "backup:"+serviceID)
 	if err != nil {
 		return err
 	}
-	_, err = a.Pool.Exec(ctx, `INSERT INTO service_backup_config(service_id,password_sealed) VALUES ($1,$2) ON CONFLICT (service_id) DO NOTHING`, serviceID, sealed)
+	login, err := randomSealed(a.KEK, "backup-login:"+serviceID)
+	if err != nil {
+		return err
+	}
+	if _, err := a.Pool.Exec(ctx, `INSERT INTO service_backup_config(service_id,password_sealed) VALUES ($1,$2) ON CONFLICT (service_id) DO NOTHING`, serviceID, pw); err != nil {
+		return err
+	}
+	if _, err := a.Pool.Exec(ctx, `UPDATE service_backup_config SET repo_user=$2, repo_password_sealed=$3 WHERE service_id=$1 AND repo_user IS NULL`, serviceID, user, login); err != nil {
+		return err
+	}
+	var sealed []byte
+	if err := a.Pool.QueryRow(ctx, `SELECT repo_password_sealed FROM service_backup_config WHERE service_id=$1`, serviceID).Scan(&sealed); err != nil {
+		return err
+	}
+	secret, err := a.KEK.Open(sealed, "backup-login:"+serviceID)
+	if err != nil {
+		return nonRetryable("unseal backup login: %v", err)
+	}
+	if _, err := a.Htpasswd.Set(user, string(secret)); err != nil {
+		return err
+	}
+	return backups.WaitLogin(ctx, &http.Client{Timeout: 5 * time.Second}, a.BackupRepo, user, string(secret), 90*time.Second)
+}
+
+func randomSealed(k *secrets.KEK, aad string) ([]byte, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+	return k.Seal([]byte(hex.EncodeToString(raw)), aad)
+}
+
+// PruneBackups applies the service's retention from the control plane (hosts cannot delete) and retires
+// backups whose snapshot is gone, so they are never offered for restore.
+func (a *Activities) PruneBackups(ctx context.Context, serviceID string) error {
+	if a.KEK == nil || !a.Pruner.Configured() {
+		return nonRetryable("backup retention unavailable: SPADE_BACKUP_ADMIN_REPO or restic not configured on the worker")
+	}
+	var keep int
+	var user *string
+	var sealed []byte
+	if err := a.Pool.QueryRow(ctx, `SELECT keep_daily, repo_user, password_sealed FROM service_backup_config WHERE service_id=$1`, serviceID).Scan(&keep, &user, &sealed); err != nil {
+		return err
+	}
+	if user == nil {
+		return nonRetryable("service %s has no backup login", serviceID)
+	}
+	pw, err := a.KEK.Open(sealed, "backup:"+serviceID)
+	if err != nil {
+		return nonRetryable("unseal backup password: %v", err)
+	}
+	kept, err := a.Pruner.Prune(ctx, *user, string(pw), "spade-"+serviceID[:8], keep)
+	if err != nil {
+		return err
+	}
+	_, err = a.Pool.Exec(ctx, `UPDATE backup_snapshot SET status='pruned' WHERE service_id=$1 AND kind='backup' AND status='succeeded'
+		AND restic_snapshot_id IS NOT NULL AND NOT (restic_snapshot_id = ANY($2::text[]))`, serviceID, kept)
 	return err
 }
 
@@ -512,15 +587,6 @@ func (a *Activities) BackupFinish(ctx context.Context, recordID, cmdID, errMsg s
 	}
 	_, err := a.Pool.Exec(ctx, `UPDATE backup_snapshot b SET status='succeeded', finished_at=now(), restic_snapshot_id=c.result->>'snapshot_id',
 		bytes_added=(c.result->>'bytes_added')::bigint FROM agent_command c WHERE b.id=$1 AND c.id=$2`, recordID, cmdID)
-	if err != nil {
-		return err
-	}
-	// Retire backups whose snapshot retention pruned, so they are never offered for restore.
-	_, err = a.Pool.Exec(ctx, `UPDATE backup_snapshot o SET status='pruned'
-		FROM backup_snapshot b JOIN agent_command c ON c.id=$2
-		WHERE b.id=$1 AND b.kind='backup' AND o.service_id=b.service_id AND o.kind='backup' AND o.status='succeeded'
-		  AND o.restic_snapshot_id IS NOT NULL AND jsonb_typeof(c.result->'kept')='array'
-		  AND NOT jsonb_exists(c.result->'kept', o.restic_snapshot_id)`, recordID, cmdID)
 	return err
 }
 

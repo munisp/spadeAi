@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/munisp/spadeai/internal/backups"
 	"github.com/munisp/spadeai/internal/providers/registry"
 	"log/slog"
 	"os"
@@ -66,6 +67,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	acts.Overlay = &overlay.Controller{Pool: pool, KEK: kek, NebulaCert: nebulaCert}
 	acts.KEK = kek
 	acts.Clouds = registry.ByName(registry.FromEnv())
+	if hp := config.Get("SPADE_BACKUP_HTPASSWD", ""); hp != "" {
+		acts.Htpasswd = &backups.Htpasswd{Path: hp}
+	}
+	acts.BackupRepo = config.Get("SPADE_BACKUP_REPO", "")
+	resticBin, _ := exec.LookPath(config.Get("RESTIC", "restic"))
+	acts.Pruner = &backups.Pruner{AdminRepo: config.Get("SPADE_BACKUP_ADMIN_REPO", ""), Restic: resticBin}
 	w := worker.New(tc, workflows.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.DeployService)
 	w.RegisterWorkflow(workflows.ServiceAction)
