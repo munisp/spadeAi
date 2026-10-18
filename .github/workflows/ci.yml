@@ -14,6 +14,11 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./cmd/...
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: helm lint deploy/helm/spade-agent -n spade-system --set gateway=https://gw.example:8443 --set caSha256=$(printf '0%.0s' {1..64})
   rust:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: rust } }

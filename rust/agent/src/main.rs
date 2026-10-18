@@ -15,6 +15,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+mod k8s;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
@@ -46,6 +48,20 @@ enum Cmd {
         #[arg(long, default_value = "/var/lib/spade/stacks")]
         stacks_dir: PathBuf,
     },
+    /// Run inside a Kubernetes cluster (installed by the Helm chart); manages one namespace per service.
+    RunK8s {
+        #[arg(long)]
+        gateway: String,
+        /// SHA-256 of the gateway CA certificate (DER), shown when the cluster was added.
+        #[arg(long, env = "SPADE_CA_SHA256")]
+        ca_sha256: String,
+        #[arg(long, default_value = "/var/lib/spade")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "spade-agent-identity")]
+        secret: String,
+        #[arg(long, env = "POD_NAMESPACE", default_value = "spade-system")]
+        namespace: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -68,7 +84,17 @@ async fn main() -> Result<()> {
             gateway,
             state_dir,
             stacks_dir,
-        } => run(&gateway, &state_dir, &stacks_dir).await,
+        } => run(&gateway, &state_dir, Some(&stacks_dir)).await,
+        Cmd::RunK8s {
+            gateway,
+            ca_sha256,
+            state_dir,
+            secret,
+            namespace,
+        } => {
+            k8s::bootstrap(&gateway, &ca_sha256, &state_dir, &secret, &namespace).await?;
+            run(&gateway, &state_dir, None).await
+        }
     }
 }
 
@@ -141,11 +167,14 @@ fn mtls_client(state: &Path) -> Result<reqwest::Client> {
         .build()?)
 }
 
-async fn run(gateway: &str, state: &Path, stacks: &Path) -> Result<()> {
+/// `stacks` is the Compose stacks directory on a VM, or None in Kubernetes mode.
+async fn run(gateway: &str, state: &Path, stacks: Option<&Path>) -> Result<()> {
     let client = mtls_client(state)?;
-    std::fs::create_dir_all(stacks)?;
-    if let Err(e) = restore_overlays(state).await {
-        eprintln!("overlay restore: {e:#}");
+    if let Some(stacks) = stacks {
+        std::fs::create_dir_all(stacks)?;
+        if let Err(e) = restore_overlays(state).await {
+            eprintln!("overlay restore: {e:#}");
+        }
     }
     let env = Env { state, gateway };
     let hb_client = client.clone();
@@ -171,7 +200,11 @@ async fn run(gateway: &str, state: &Path, stacks: &Path) -> Result<()> {
             Ok(r) if r.status().is_success() => {
                 backoff = 1;
                 let cmd: Command_ = r.json().await?;
-                let (status, result) = match execute(&cmd, stacks, &env).await {
+                let res = match stacks {
+                    Some(stacks) => execute(&cmd, stacks, &env).await,
+                    None => k8s::execute(&cmd.verb, &cmd.payload).await,
+                };
+                let (status, result) = match res {
                     Ok(v) => ("succeeded", v),
                     Err(e) => ("failed", json!({"error": format!("{e:#}")})),
                 };

@@ -77,6 +77,20 @@ Backups are isolated per service. The tenant restic REST server (compose `backup
 
 Planned switchover: `docker compose -f deploy/ha/docker-compose.ha.yml exec pg-lagos patronictl -c /etc/patroni.yml switchover`.
 
+### Kubernetes (on-premises, data centre or managed clusters)
+
+SpadeAi deploys into your own Kubernetes cluster (k3s, RKE2, OpenShift, upstream Kubernetes, EKS, AKS, GKE) through one in-cluster agent. It connects **outbound only** to the gateway over mTLS, so SpadeAi never holds a kubeconfig and the cluster needs no inbound firewall rule.
+
+1. Add the cluster (PWA: project → *Add Kubernetes cluster*; CLI: `spade clusters add PROJECT_ID lagos-dc1 --distribution k3s --in-nigeria`). SpadeAi returns a Helm command with the gateway URL, the CA pin and a single-use enrolment token (1 hour).
+2. Run it with a kubeconfig for that cluster. The agent image is built from `rust/agent/Dockerfile.k8s` (push it to your registry and add `--set image.repository=...,image.tag=...`). The chart is `deploy/helm/spade-agent`; the agent checks the gateway CA against `caSha256` before enrolling and stores its identity in the `spade-agent-identity` Secret, so pod restarts don't need a new token.
+3. *Refresh inventory* (`spade clusters refresh CLUSTER_ID`): the agent reports the Kubernetes version, nodes, allocatable CPU/memory, storage classes, ingress classes and cert-manager ClusterIssuers.
+4. The configuration menu (`spade clusters options CLUSTER_ID`, the deploy form in the PWA and mobile app) is built from that inventory: size per replica, replicas (1-20), namespace, storage class and size, domain/Ingress host, ingress class, TLS issuer, network policy (`isolated` by default: only the same namespace, the ingress controller namespace and the agent pod in `spade-system`, for health probes, may connect; install the chart in `spade-system`) and environment variables.
+5. Deploy: `spade deploy PROJECT_ID whoami web kubernetes:SMALL-1C-2G --cluster CLUSTER_ID --namespace web --replicas 2 --host web.example.ng --ingress-class traefik`. Day 2: `spade action SERVICE_ID start|stop|restart|delete` and `spade scale SERVICE_ID 3`.
+
+Each service gets its own namespace, labelled `spade.ai/service=<id>`. The control plane renders the template's Compose file into a restricted manifest (Namespace, Secret, PVC, Deployment, Service, Ingress, NetworkPolicy; no host networking, host paths, privileged containers, extra capabilities or service-account tokens), and the agent re-checks every object against the same rules plus the manifest's sha256 before `kubectl apply`. It refuses namespaces it does not own and only deletes its own. Billing meters CPU, memory and disk per replica. Templates with persistent volumes run one replica (ReadWriteOnce). Residency: a cluster is marked in Nigeria by the operator who adds it (a declaration, not verified); residency-locked orgs can only deploy to such clusters. **Not yet available:** backups/restore of Kubernetes services (refused, capability `backups.kubernetes`), logs, version upgrades and app-to-app network rules beyond the namespace policy. The agent's ClusterRole is cluster-wide (it must create namespaces) and includes Secrets, so treat the agent like any cluster operator.
+
+`scripts/e2e-k8s.sh` runs all of this against a local k3s container (`rancher/k3s:v1.31.4-k3s1`) with `helm`; build the agent image first and set `GATEWAY_HOSTS` to include `172.17.0.1` so pods can reach the gateway.
+
 ### Cloud providers (Hetzner, DigitalOcean, Vultr, Akamai/Linode, AWS, OpenStack, Proxmox)
 All API providers share one adapter (`internal/providers/cloud`): servers are tagged with the service and enrolment attempt, so a retried deploy never creates a second server, stale attempts are removed, and deleting a service removes every server it owns. First boot (cloud-init, Ubuntu 24.04) locks the root password, installs Docker + Compose, WireGuard tools, restic and a pinned Nebula, then runs the embedded agent installer, which checks the gateway CA pin before downloading anything.
 

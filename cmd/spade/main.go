@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -109,6 +110,14 @@ const usage = `spade — SpadeAi CLI
   spade projects create ORG_ID NAME EMAIL [--overlay nebula|wireguard]
   spade templates
   spade deploy PROJECT_ID TEMPLATE NAME SIZE
+  spade deploy PROJECT_ID TEMPLATE NAME kubernetes:SIZE --cluster ID --namespace NS [--replicas N]
+        [--storage-class SC] [--storage-gb N] [--host DOMAIN] [--ingress-class IC] [--tls-issuer ISSUER]
+        [--network-policy isolated|open] [--env KEY=VALUE ...]
+  spade clusters add PROJECT_ID NAME [--distribution k3s|rke2|openshift|kubernetes|eks|aks|gke] [--in-nigeria]
+  spade clusters list PROJECT_ID
+  spade clusters refresh CLUSTER_ID   (agent re-reports storage/ingress classes, issuers, capacity)
+  spade clusters options CLUSTER_ID   (the Kubernetes configuration menu)
+  spade scale SERVICE_ID REPLICAS     (Kubernetes services)
   spade services PROJECT_ID
   spade backups list|create SERVICE_ID
   spade backups restore SERVICE_ID BACKUP_ID   (overwrites current data)
@@ -198,7 +207,69 @@ func run(a []string) error {
 		if err := need(5); err != nil {
 			return err
 		}
-		return show(call(c, "POST", "/v1/projects/"+a[1]+"/services", map[string]any{"template": a[2], "display_name": a[3], "size": a[4]}, true))
+		body := map[string]any{"template": a[2], "display_name": a[3], "size": a[4]}
+		if strings.HasPrefix(a[4], "kubernetes:") {
+			fs := flag.NewFlagSet("deploy", flag.ContinueOnError)
+			cluster, ns := fs.String("cluster", "", ""), fs.String("namespace", "", "")
+			replicas, gb := fs.Int("replicas", 1, ""), fs.Int("storage-gb", 0, "")
+			sc, host, ic := fs.String("storage-class", "", ""), fs.String("host", "", ""), fs.String("ingress-class", "", "")
+			issuer, np := fs.String("tls-issuer", "", ""), fs.String("network-policy", "isolated", "")
+			env := map[string]string{}
+			fs.Func("env", "KEY=VALUE", func(v string) error {
+				k, val, ok := strings.Cut(v, "=")
+				if !ok {
+					return errors.New("--env needs KEY=VALUE")
+				}
+				env[k] = val
+				return nil
+			})
+			if err := fs.Parse(a[5:]); err != nil {
+				return err
+			}
+			if *cluster == "" || *ns == "" {
+				return errors.New("kubernetes deploys need --cluster and --namespace (see: spade clusters options CLUSTER_ID)")
+			}
+			body["env"] = env
+			body["kubernetes"] = map[string]any{"cluster_id": *cluster, "namespace": *ns, "replicas": *replicas, "storage_class": *sc,
+				"storage_gb": *gb, "host": *host, "ingress_class": *ic, "tls_issuer": *issuer, "network_policy": *np}
+		}
+		return show(call(c, "POST", "/v1/projects/"+a[1]+"/services", body, true))
+	case "clusters":
+		if err := need(3); err != nil {
+			return err
+		}
+		switch a[1] {
+		case "add":
+			if err := need(4); err != nil {
+				return err
+			}
+			fs := flag.NewFlagSet("clusters", flag.ContinueOnError)
+			dist, ng := fs.String("distribution", "kubernetes", ""), fs.Bool("in-nigeria", false, "")
+			if err := fs.Parse(a[4:]); err != nil {
+				return err
+			}
+			out, err := call(c, "POST", "/v1/projects/"+a[2]+"/clusters", map[string]any{"name": a[3], "distribution": *dist, "in_nigeria": *ng}, false)
+			if err == nil {
+				fmt.Printf("Install the agent in your cluster (token is single-use, expires %v):\n\n  %v\n\n", out["enrol_expires_at"], out["helm"])
+			}
+			return show(out, err)
+		case "list":
+			return show(call(c, "GET", "/v1/projects/"+a[2]+"/clusters", nil, false))
+		case "refresh":
+			return show(call(c, "POST", "/v1/clusters/"+a[2]+"/refresh", nil, false))
+		case "options":
+			return show(call(c, "GET", "/v1/clusters/"+a[2]+"/options", nil, false))
+		}
+		return errors.New("usage: spade clusters add|list|refresh|options ...")
+	case "scale":
+		if err := need(3); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(a[2])
+		if err != nil {
+			return errors.New("REPLICAS must be a number")
+		}
+		return show(call(c, "POST", "/v1/services/"+a[1]+"/actions/scale", map[string]any{"replicas": n}, true))
 	case "services":
 		if err := need(2); err != nil {
 			return err

@@ -6,7 +6,11 @@ type Org = { id: string; name: string; billing_mode: string; ai_policy: string }
 type Wallet = { arrears_minor: number; balance: { available_minor: number; pending_debits_minor: number; posted_balance_minor: number } };
 type Project = { id: string; name: string; org_id: string; overlay_kind?: string };
 type Template = { slug: string; name: string; version: string; description: string };
-type Service = { id: string; display_name: string; template: string; state: string; state_reason: string | null };
+type Service = { id: string; display_name: string; template: string; state: string; state_reason: string | null; provider_id?: string };
+type Cluster = { id: string; name: string; distribution: string; in_nigeria: boolean; enrolled: boolean; online: boolean; last_seen_at: string | null; agent_version: string | null; services: number };
+type Field = { name: string; label: string; type: "select" | "int" | "text" | "map"; required?: boolean; options?: string[]; default?: string | number; min?: number; max?: number; help?: string };
+type KubeMenu = { kubernetes_version: string; nodes: number; allocatable_cpu_milli: number; allocatable_memory_mb: number; inventory_at: string; fields: Field[] };
+type KubeForm = { t: Template; name: string; cluster: Cluster; menu: KubeMenu; values: Record<string, string> };
 type OverlayPeer = { service_id: string; display_name: string; overlay_ip: string; endpoint: string; last_apply_status: string | null; applied_generation: number | null };
 type Backup = { id: string; kind: string; status: string; started_at: string; bytes_added: number | null; error: string | null };
 type Size = { id: string; provider_id: string; code: string; vcpu: number; ram_mb: number; disk_gb: number };
@@ -33,6 +37,9 @@ export function App() {
   const [bootstrap, setBootstrap] = useState("");
   const [overlay, setOverlay] = useState<Overlay | null>(null);
   const [backups, setBackups] = useState<{ svc: string; items: Backup[] } | null>(null);
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [helmCmd, setHelmCmd] = useState("");
+  const [kform, setKform] = useState<KubeForm | null>(null);
 
   const guard = (f: () => Promise<void>) => () => { setErr(""); f().catch(e => setErr(String(e.message ?? e))); };
 
@@ -47,6 +54,17 @@ export function App() {
 
   const loadOrgs = useCallback(async () => setOrgs((await call<{ items: Org[] }>("/v1/orgs")).items ?? []), []);
   useEffect(() => { if (user) loadOrgs().catch(e => setErr(e.message)); }, [user, loadOrgs]);
+  useEffect(() => { if (err) window.scrollTo({ top: 0, behavior: "smooth" }); }, [err]);
+  useEffect(() => {
+    if (!project) return;
+    const t = setInterval(() => {
+      Promise.all([
+        call<{ items: Service[] }>(`/v1/projects/${project.id}/services`).then(r => setServices(r.items ?? [])),
+        call<{ items: Cluster[] }>(`/v1/projects/${project.id}/clusters`).then(r => setClusters(r.items ?? [])),
+      ]).catch(() => undefined);
+    }, 10000);
+    return () => clearInterval(t);
+  }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const openOrg = async (o: Org) => {
     setOrg(o); setProject(null);
@@ -58,15 +76,66 @@ export function App() {
     setTemplates((await call<{ items: Template[] }>("/v1/templates")).items ?? []);
     setServices((await call<{ items: Service[] }>(`/v1/projects/${p.id}/services`)).items ?? []);
     setOverlay(await call<Overlay>(`/v1/projects/${p.id}/overlay`));
+    setClusters((await call<{ items: Cluster[] }>(`/v1/projects/${p.id}/clusters`)).items ?? []);
+  };
+  const waitOp = async (id: string, onResponse?: (r: { bootstrap?: string }) => boolean) => {
+    for (let i = 0; i < 300; i++) {
+      const o = await call<{ status: string; response?: { bootstrap?: string }; error?: string }>(`/v1/operations/${id}`);
+      if (o.response && onResponse?.(o.response)) return;
+      if (o.status === "failed") throw new Error(o.error ?? "operation failed");
+      if (o.status === "succeeded") return;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  };
+  const addCluster = async () => {
+    const name = prompt("Cluster name (lowercase, e.g. lagos-dc1)"); if (!name) return;
+    const distribution = prompt("Distribution: kubernetes | k3s | rke2 | openshift | eks | aks | gke", "kubernetes"); if (!distribution) return;
+    const in_nigeria = confirm("Is this cluster physically located in Nigeria? (Residency-locked organisations can only deploy to Nigerian clusters.)");
+    const r = await call<{ helm: string }>(`/v1/projects/${project!.id}/clusters`, { method: "POST", body: JSON.stringify({ name, distribution, in_nigeria }) });
+    setHelmCmd(r.helm); await openProject(project!);
+  };
+  const refreshCluster = async (c: Cluster) => { await call(`/v1/clusters/${c.id}/refresh`, { method: "POST" }); setErr("Inventory requested; the menu updates once the agent reports (a few seconds)."); };
+  const openKubeForm = async (t: Template, name: string, size: string) => {
+    const online = clusters.filter(c => c.online);
+    if (online.length === 0) throw new Error("no Kubernetes cluster is online in this project; add one and install the agent first");
+    const pick = online.length === 1 ? online[0].name : prompt(`Cluster: ${online.map(c => c.name).join(" | ")}`, online[0].name);
+    const cluster = online.find(c => c.name === pick); if (!cluster) return;
+    const menu = await call<KubeMenu>(`/v1/clusters/${cluster.id}/options`);
+    const values: Record<string, string> = { namespace: `${t.slug}-${name}`.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) };
+    for (const f of menu.fields) if (f.default !== undefined) values[f.name] = String(f.default);
+    values.size = size;
+    setKform({ t, name, cluster, menu, values });
+  };
+  const submitKube = async () => {
+    const { t, name, cluster, values } = kform!;
+    const env: Record<string, string> = {};
+    for (const line of (values.env ?? "").split("\n").map(l => l.trim()).filter(Boolean)) {
+      const i = line.indexOf("="); if (i < 1) throw new Error(`environment line "${line}" is not KEY=VALUE`);
+      env[line.slice(0, i)] = line.slice(i + 1);
+    }
+    const num = (k: string) => (values[k] ? Number(values[k]) : undefined);
+    const kubernetes = { cluster_id: cluster.id, namespace: values.namespace, replicas: num("replicas") ?? 1, storage_class: values.storage_class || undefined,
+      storage_gb: num("storage_gb"), host: values.host || undefined, ingress_class: values.host ? values.ingress_class || undefined : undefined,
+      tls_issuer: values.tls_issuer || undefined, network_policy: values.network_policy || undefined, ingress_namespace: values.ingress_namespace || undefined };
+    const op = await call<{ id: string }>(`/v1/projects/${project!.id}/services`, { method: "POST", idempotent: true, body: JSON.stringify({ template: t.slug, display_name: name, size: values.size, env, kubernetes }) });
+    setKform(null);
+    await waitOp(op.id);
+    await openProject(project!);
+  };
+  const scale = async (v: Service) => {
+    const n = Number(prompt("Replicas (1-20)", "2")); if (!n) return;
+    const op = await call<{ id: string }>(`/v1/services/${v.id}/actions/scale`, { method: "POST", idempotent: true, body: JSON.stringify({ replicas: n }) });
+    await waitOp(op.id); await openProject(project!);
   };
   const deploy = async (t: Template) => {
     const name = prompt(`Name for ${t.name}`, t.slug); if (!name) return;
-    const ready = (p: string) => p === "byovm" || caps.find(c => c.component === `provider.${p}`)?.status === "available";
+    const ready = (p: string) => p === "byovm" || (p === "kubernetes" && clusters.some(c => c.online)) || caps.find(c => c.component === `provider.${p}`)?.status === "available";
     const sizes = (await call<{ items: Size[] }>("/v1/sizes")).items ?? [];
     const offered = sizes.filter(z => ready(z.provider_id)).map(z => z.id);
     const missing = [...new Set(sizes.filter(z => !ready(z.provider_id)).map(z => z.provider_id))];
     const size = prompt(`Size: ${offered.join(" | ")}${missing.length ? ` (unavailable: ${missing.join(", ")})` : ""}`, "byovm:SMALL-1C-2G"); if (!size) return;
     if (!offered.includes(size)) throw new Error(`size ${size} is not offered by an available provider`);
+    if (size.startsWith("kubernetes:")) return openKubeForm(t, name, size);
     const op = await call<{ id: string }>(`/v1/projects/${project!.id}/services`, { method: "POST", idempotent: true, body: JSON.stringify({ template: t.slug, display_name: name, size }) });
     for (let i = 0; i < 30; i++) {
       const o = await call<{ status: string; response?: { bootstrap?: string }; error?: string }>(`/v1/operations/${op.id}`);
@@ -131,7 +200,8 @@ export function App() {
         {services.map(v => <div key={v.id} style={{ marginBottom: 6 }}>
           <b>{v.display_name}</b> ({v.template}) <span style={s.pill(v.state === "running")}>{v.state}</span> {v.state_reason && <small>{v.state_reason}</small>}
           {["start", "stop", "restart", "delete"].map(a => <button key={a} style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => act(v, a))}>{a}</button>)}
-          <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => backupNow(v))}>back up</button>
+          {v.provider_id === "kubernetes" && <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => scale(v))}>scale</button>}
+          {v.provider_id !== "kubernetes" && <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => backupNow(v))}>back up</button>}
           <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => showBackups(v))}>backups</button>
           {backups?.svc === v.id && <div style={{ marginLeft: 16 }}>
             {backups.items.length === 0 && <small>No backups yet.</small>}
@@ -148,6 +218,28 @@ export function App() {
             const inSync = p.last_apply_status === "succeeded" && p.applied_generation === overlay.generation;
             return <div key={p.service_id}><b>{p.display_name}</b> {p.overlay_ip} <span style={s.pill(inSync)}>{inSync ? "in sync" : (p.last_apply_status ?? "pending")}</span></div>;
           })}
+        </div>}
+        <h4>Kubernetes clusters</h4>
+        {clusters.length === 0 && <p>No clusters. Add one to deploy into your own on-premises or cloud Kubernetes.</p>}
+        {clusters.map(c => <div key={c.id}><b>{c.name}</b> <small>{c.distribution}{c.in_nigeria ? " · in Nigeria" : ""} · {c.services} services{c.agent_version ? ` · agent ${c.agent_version}` : ""}</small>{" "}
+          <span style={s.pill(c.online)}>{c.online ? "online" : c.enrolled ? "offline" : "waiting for agent"}</span>
+          {c.enrolled && <button style={{ ...s.btn, padding: "2px 8px", marginLeft: 6 }} onClick={guard(() => refreshCluster(c))}>refresh inventory</button>}</div>)}
+        <button style={s.btn} onClick={guard(addCluster)}>Add Kubernetes cluster</button>
+        {helmCmd && <div style={{ ...s.card, background: "#f0fdfa", marginTop: 8 }}><b>Install the agent in your cluster (outbound-only; the token is single-use and expires in 1 hour):</b>
+          <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{helmCmd}</pre></div>}
+        {kform && <div style={{ ...s.card, background: "#f8fafc", marginTop: 8 }}>
+          <h4>Deploy {kform.t.name} to {kform.cluster.name}</h4>
+          <small>Kubernetes {kform.menu.kubernetes_version} · {kform.menu.nodes} nodes · {(kform.menu.allocatable_cpu_milli / 1000).toFixed(1)} vCPU · {Math.round(kform.menu.allocatable_memory_mb / 1024)} GiB allocatable · inventory {new Date(kform.menu.inventory_at).toLocaleString()}</small>
+          {kform.menu.fields.map(f => {
+            const v = kform.values[f.name] ?? "";
+            const set = (x: string) => setKform({ ...kform, values: { ...kform.values, [f.name]: x } });
+            return <label key={f.name} style={{ display: "block", margin: "6px 0" }}>{f.label}{f.required ? " *" : ""}<br />
+              {f.type === "select" ? <select value={v} onChange={e => set(e.target.value)}>{!f.required && <option value="">(none)</option>}{(f.options ?? []).map(o => <option key={o}>{o}</option>)}</select>
+                : f.type === "map" ? <textarea rows={3} cols={50} placeholder="KEY=VALUE, one per line" value={v} onChange={e => set(e.target.value)} />
+                : <input type={f.type === "int" ? "number" : "text"} min={f.min} max={f.max} value={v} onChange={e => set(e.target.value)} />}
+              {f.help && <small> {f.help}</small>}</label>;
+          })}
+          <button style={s.btn} onClick={guard(submitKube)}>Deploy</button><button style={{ ...s.btn, background: "#6b7280" }} onClick={() => setKform(null)}>Cancel</button>
         </div>}
         {bootstrap && <div style={{ ...s.card, background: "#f0fdfa" }}><b>Run on your VM to attach it (expires in 15 min):</b><pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{bootstrap}</pre></div>}
         <h4>Catalogue (tested versions only)</h4>

@@ -4,6 +4,7 @@ package workflows
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,8 +105,15 @@ func DeployService(ctx workflow.Context, opID, serviceID string) error {
 	if err := workflow.ExecuteActivity(waiting(ctx, AgentWait), a.WaitForAgent, serviceID).Get(ctx, nil); err != nil {
 		return fail("agent_enrolment", err)
 	}
-	if err := joinOverlay(ctx, a, serviceID); err != nil {
-		return fail("overlay", err)
+	var provider string
+	if err := workflow.ExecuteActivity(sctx, a.ServiceProvider, serviceID).Get(ctx, &provider); err != nil {
+		return fail("state", err)
+	}
+	// Kubernetes services use the cluster network (and its NetworkPolicy), not the host overlay.
+	if provider != "kubernetes" {
+		if err := joinOverlay(ctx, a, serviceID); err != nil {
+			return fail("overlay", err)
+		}
 	}
 	if err := workflow.ExecuteActivity(sctx, a.SetState, serviceID, "installing_app", "").Get(ctx, nil); err != nil {
 		return fail("state", err)
@@ -177,6 +185,9 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 	var a *Activities
 	sctx := short(ctx)
 	_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "running", workflow.GetInfo(ctx).WorkflowExecution.ID, "", nil).Get(ctx, nil)
+	if n, ok := strings.CutPrefix(action, "scale:"); ok {
+		return scaleService(ctx, a, opID, serviceID, n)
+	}
 	verb, final := map[string][2]string{
 		"start": {"compose_up", "running"}, "stop": {"compose_down", "stopped"},
 		"restart": {"compose_restart", "running"}, "delete": {"compose_down", "deleted"},
@@ -199,10 +210,14 @@ func ServiceAction(ctx workflow.Context, opID, serviceID, action string) error {
 	}
 	if action == "delete" {
 		// Best effort: the host may already be gone. Remaining members are resynced without this peer.
-		_ = runCommand(ctx, a, serviceID, "overlay_down")
-		var projectID string
-		if err := workflow.ExecuteActivity(sctx, a.OverlayRemove, serviceID).Get(ctx, &projectID); err == nil && projectID != "" {
-			_ = syncOverlay(ctx, a, projectID, "")
+		var provider string
+		_ = workflow.ExecuteActivity(sctx, a.ServiceProvider, serviceID).Get(ctx, &provider)
+		if provider != "kubernetes" {
+			_ = runCommand(ctx, a, serviceID, "overlay_down")
+			var projectID string
+			if err := workflow.ExecuteActivity(sctx, a.OverlayRemove, serviceID).Get(ctx, &projectID); err == nil && projectID != "" {
+				_ = syncOverlay(ctx, a, projectID, "")
+			}
 		}
 		// Containers are down; a server we failed to delete would keep costing the customer, so the
 		// service stays visible as stopped with the error instead of reporting deleted.
@@ -333,4 +348,31 @@ func RestoreService(ctx workflow.Context, opID, serviceID, backupID string) erro
 		return failOp(werr)
 	}
 	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", map[string]any{"restore_id": rec, "backup_id": backupID}).Get(ctx, nil)
+}
+
+// scaleService changes a Kubernetes service's replica count. Billing follows the stored count from the
+// moment it changes; if the cluster refuses the new manifests the old count (and bill) is restored.
+func scaleService(ctx workflow.Context, a *Activities, opID, serviceID, n string) error {
+	sctx := short(ctx)
+	replicas, err := strconv.Atoi(n)
+	fail := func(err error) error {
+		_ = workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "failed", "", err.Error(), nil).Get(ctx, nil)
+		return err
+	}
+	if err != nil {
+		return fail(err)
+	}
+	var prev int
+	if err := workflow.ExecuteActivity(sctx, a.SetReplicas, serviceID, replicas).Get(ctx, &prev); err != nil {
+		return fail(err)
+	}
+	if err := runCommand(ctx, a, serviceID, "apply_bundle"); err != nil {
+		_ = workflow.ExecuteActivity(sctx, a.SetReplicas, serviceID, prev).Get(ctx, nil)
+		_ = runCommand(ctx, a, serviceID, "apply_bundle")
+		return fail(err)
+	}
+	if err := runCommand(ctx, a, serviceID, "health_probe"); err != nil {
+		return fail(err)
+	}
+	return workflow.ExecuteActivity(sctx, a.MarkOperation, opID, "succeeded", "", "", map[string]any{"replicas": replicas, "previous": prev}).Get(ctx, nil)
 }

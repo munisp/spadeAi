@@ -1,0 +1,12 @@
+# Shown by SpadeAi when you add a cluster (PWA, mobile, or `spade clusters add`).
+gateway: ""          # https://gateway.example.ng:8443
+caSha256: ""         # SHA-256 of the gateway CA certificate (DER)
+enrolToken: ""       # single-use, expires after 1 hour; useless once the agent has enrolled
+image:
+  repository: spade-agent-k8s
+  tag: dev
+  pullPolicy: IfNotPresent
+identitySecret: spade-agent-identity
+resources:
+  requests: {cpu: 20m, memory: 32Mi}
+  limits: {cpu: 500m, memory: 256Mi}

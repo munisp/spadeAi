@@ -1,0 +1,6 @@
+apiVersion: v2
+name: spade-agent
+description: SpadeAi in-cluster agent. Connects outbound only to the SpadeAi gateway and manages one namespace per SpadeAi service.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

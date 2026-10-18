@@ -97,7 +97,7 @@ func setStateTx(ctx context.Context, tx pgx.Tx, serviceID, state, reason string)
 		return err
 	}
 	if billable[state] {
-		if _, err := tx.Exec(ctx, `INSERT INTO service_state_interval(service_id,state) VALUES ($1,$2)`, serviceID, state); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO service_state_interval(service_id,state,replicas) SELECT $1,$2,replicas FROM service WHERE id=$1`, serviceID, state); err != nil {
 			return err
 		}
 	}
@@ -120,7 +120,7 @@ func (a *Activities) info(ctx context.Context, serviceID string) (*svcInfo, erro
 	var s svcInfo
 	err := a.Pool.QueryRow(ctx, `
 		SELECT o.id::text, 'NGN', o.billing_mode, s.provider_id,
-		  ((z.vcpu*coalesce(pv.price_minor,0) + (z.ram_mb/1024.0)*coalesce(pr.price_minor,0) + z.disk_gb*coalesce(pd.price_minor,0) + coalesce(ps.price_minor,0)) / 1000)::bigint
+		  ((s.replicas*(z.vcpu*coalesce(pv.price_minor,0) + (z.ram_mb/1024.0)*coalesce(pr.price_minor,0) + z.disk_gb*coalesce(pd.price_minor,0)) + coalesce(ps.price_minor,0)) / 1000)::bigint
 		FROM service s JOIN project p ON p.id=s.project_id JOIN organization o ON o.id=p.org_id JOIN size z ON z.id=s.size_id
 		JOIN price_book b ON b.status='effective'
 		LEFT JOIN price_item pv ON pv.price_book_version=b.version AND pv.sku='mgmt.vcpu.hour'
@@ -165,6 +165,9 @@ func (a *Activities) Provision(ctx context.Context, serviceID string) (*Provisio
 	s, err := a.info(ctx, serviceID)
 	if err != nil {
 		return nil, err
+	}
+	if s.Provider == "kubernetes" {
+		return a.provisionKube(ctx, serviceID)
 	}
 	d := a.Clouds[s.Provider]
 	switch {
@@ -243,6 +246,10 @@ func (a *Activities) Deprovision(ctx context.Context, serviceID string) error {
 	if err != nil {
 		return err
 	}
+	if s.Provider == "kubernetes" {
+		// The cluster and its agent belong to the customer; only this service's namespace is removed.
+		return a.teardownKube(ctx, serviceID)
+	}
 	if d := a.Clouds[s.Provider]; d != nil {
 		if !d.Configured() {
 			return nonRetryable("%s server for %s not deleted: %s not configured", s.Provider, serviceID, d.TokenEnv())
@@ -269,7 +276,7 @@ func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {
 	defer t.Stop()
 	for {
 		var ok bool
-		err := a.Pool.QueryRow(ctx, `SELECT cert_fingerprint IS NOT NULL AND last_seen_at > now() - interval '2 minutes' FROM agent WHERE service_id=$1`, serviceID).Scan(&ok)
+		err := a.Pool.QueryRow(ctx, `SELECT a.cert_fingerprint IS NOT NULL AND a.last_seen_at > now() - interval '2 minutes' FROM service s JOIN agent a ON `+agentOf+` WHERE s.id=$1`, serviceID).Scan(&ok)
 		if err == nil && ok {
 			return nil
 		}
@@ -283,11 +290,11 @@ func (a *Activities) WaitForAgent(ctx context.Context, serviceID string) error {
 }
 
 func (a *Activities) QueueCommand(ctx context.Context, serviceID, verb string) (string, error) {
-	var agentID, compose, sha, display string
+	var agentID, compose, sha, display, provider string
 	var manifest, env []byte
-	err := a.Pool.QueryRow(ctx, `SELECT a.id::text, tv.compose, tv.compose_sha256, tv.manifest, s.env, s.display_name FROM service s
-		JOIN template_version tv ON tv.id=s.template_version_id JOIN agent a ON a.service_id=s.id WHERE s.id=$1 AND a.cert_fingerprint IS NOT NULL`, serviceID).
-		Scan(&agentID, &compose, &sha, &manifest, &env, &display)
+	err := a.Pool.QueryRow(ctx, `SELECT a.id::text, tv.compose, tv.compose_sha256, tv.manifest, s.env, s.display_name, s.provider_id FROM service s
+		JOIN template_version tv ON tv.id=s.template_version_id JOIN agent a ON `+agentOf+` WHERE s.id=$1 AND a.cert_fingerprint IS NOT NULL`, serviceID).
+		Scan(&agentID, &compose, &sha, &manifest, &env, &display, &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nonRetryable("service %s has no enrolled agent", serviceID)
 	}
@@ -297,14 +304,20 @@ func (a *Activities) QueueCommand(ctx context.Context, serviceID, verb string) (
 	payload := map[string]any{"project": "spade-" + serviceID[:8]}
 	var m map[string]any
 	_ = json.Unmarshal(manifest, &m)
-	switch verb {
-	case "apply_bundle":
+	if provider == "kubernetes" {
+		if payload, err = a.kubePayload(ctx, serviceID, verb, compose, manifest, env); err != nil {
+			return "", err
+		}
+	}
+	switch {
+	case provider == "kubernetes":
+	case verb == "apply_bundle":
 		var e map[string]string
 		_ = json.Unmarshal(env, &e)
 		payload["compose"], payload["compose_sha256"], payload["env"] = compose, sha, e
-	case "health_probe":
+	case verb == "health_probe":
 		payload["health"] = m["health"]
-	case "overlay_keygen", "overlay_down":
+	case verb == "overlay_keygen" || verb == "overlay_down":
 		var projectID, kind string
 		if err := a.Pool.QueryRow(ctx, `SELECT p.id::text, p.overlay_kind FROM service s JOIN project p ON p.id=s.project_id WHERE s.id=$1`, serviceID).Scan(&projectID, &kind); err != nil {
 			return "", err
@@ -466,6 +479,13 @@ func (a *Activities) OverlayRemove(ctx context.Context, serviceID string) (strin
 // EnsureBackupConfig creates the service's restic password and its own repository login (both random,
 // sealed with the KEK) on first use, and makes sure the tenant server accepts that login.
 func (a *Activities) EnsureBackupConfig(ctx context.Context, serviceID string) error {
+	var provider string
+	if err := a.Pool.QueryRow(ctx, `SELECT provider_id FROM service WHERE id=$1`, serviceID).Scan(&provider); err != nil {
+		return err
+	}
+	if provider == "kubernetes" {
+		return nonRetryable("backups are not yet available for Kubernetes services (volume snapshots/Velero not implemented)")
+	}
 	if a.KEK == nil {
 		return nonRetryable("backups unavailable: KEK not configured")
 	}
