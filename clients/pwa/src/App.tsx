@@ -54,6 +54,17 @@ export function App() {
 
   const loadOrgs = useCallback(async () => setOrgs((await call<{ items: Org[] }>("/v1/orgs")).items ?? []), []);
   useEffect(() => { if (user) loadOrgs().catch(e => setErr(e.message)); }, [user, loadOrgs]);
+  useEffect(() => { if (err) window.scrollTo({ top: 0, behavior: "smooth" }); }, [err]);
+  useEffect(() => {
+    if (!project) return;
+    const t = setInterval(() => {
+      Promise.all([
+        call<{ items: Service[] }>(`/v1/projects/${project.id}/services`).then(r => setServices(r.items ?? [])),
+        call<{ items: Cluster[] }>(`/v1/projects/${project.id}/clusters`).then(r => setClusters(r.items ?? [])),
+      ]).catch(() => undefined);
+    }, 10000);
+    return () => clearInterval(t);
+  }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const openOrg = async (o: Org) => {
     setOrg(o); setProject(null);
@@ -190,7 +201,7 @@ export function App() {
           <b>{v.display_name}</b> ({v.template}) <span style={s.pill(v.state === "running")}>{v.state}</span> {v.state_reason && <small>{v.state_reason}</small>}
           {["start", "stop", "restart", "delete"].map(a => <button key={a} style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => act(v, a))}>{a}</button>)}
           {v.provider_id === "kubernetes" && <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => scale(v))}>scale</button>}
-          <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => backupNow(v))}>back up</button>
+          {v.provider_id !== "kubernetes" && <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => backupNow(v))}>back up</button>}
           <button style={{ ...s.btn, padding: "2px 8px" }} onClick={guard(() => showBackups(v))}>backups</button>
           {backups?.svc === v.id && <div style={{ marginLeft: 16 }}>
             {backups.items.length === 0 && <small>No backups yet.</small>}

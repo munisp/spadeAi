@@ -525,7 +525,7 @@ func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 			if inNigeria, cfg, err = prepareKube(r.Context(), tx, p, tvID, in.Size, in.Kubernetes, in.Env); err != nil {
 				return err
 			}
-			kubeCluster, kubeCfg, replicas = in.Kubernetes.ClusterID, cfg, in.Kubernetes.Replicas
+			kubeCluster, kubeCfg, replicas = in.Kubernetes.ClusterID, cfg, *in.Kubernetes.Replicas
 		} else if in.Kubernetes != nil {
 			return fmt.Errorf("the kubernetes block needs a kubernetes:* size")
 		}
@@ -662,6 +662,14 @@ func (s *Server) restoreBackup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) backupOp(w http.ResponseWriter, r *http.Request, id, perm, verb string, body []byte, start func(string) error) {
 	key := r.Header.Get("Idempotency-Key")
 	if !require(w, key != "", "Idempotency-Key header is required") || !s.allow(w, r, "service", id, perm) {
+		return
+	}
+	var provider string
+	if err := s.Pool.QueryRow(r.Context(), `SELECT provider_id FROM service WHERE id::text=$1`, id).Scan(&provider); err != nil {
+		writeErr(w, 404, "not_found", "service not found")
+		return
+	}
+	if !require(w, provider != "kubernetes", "backups are not yet available for Kubernetes services (volume snapshots/Velero not implemented)") {
 		return
 	}
 	var opID string

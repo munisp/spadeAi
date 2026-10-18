@@ -70,6 +70,7 @@ KB() { echo "{\"template\":\"$1\",\"display_name\":\"$2\",\"size\":\"kubernetes:
 [ "$(dep bad2 "$(KB whoami w '"namespace":"x","storage_class":"gold"')")" = 422 ] || fail "unknown storage class accepted"
 [ "$(dep bad3 "$(KB static-site k '"namespace":"site","replicas":2')")" = 422 ] || fail "RWO template accepted 2 replicas"
 grep -q ReadWriteOnce /tmp/e2e-k8s.out || fail "RWO refusal not explained"
+[ "$(dep bad4 "$(KB whoami z '"namespace":"zero","replicas":0')")" = 422 ] || fail "replicas=0 accepted"
 sql "UPDATE organization SET residency_locked=true WHERE id='$ORG'" >/dev/null
 sql "UPDATE k8s_cluster SET in_nigeria=false WHERE id='$CID'" >/dev/null
 [ "$(dep bad4 "$(KB whoami w '"namespace":"res"')")" = 422 ] || fail "residency-locked org deployed to a non-Nigerian cluster"
@@ -109,8 +110,8 @@ echo "ok: scale 2->3 (billing split), stop/start, foreign namespace refused and 
 KOP=$(j "d['id']" </tmp/e2e-k8s.out); [ "$(op "$KOP")" = succeeded ] || fail "site deploy failed: $(curl -sf "${H[@]}" "$API/v1/operations/$KOP")"
 [ "$(k get pvc data-site -n e2e-site -o jsonpath='{.status.phase}')" = Bound ] || fail "site PVC not bound"
 KSVC=$(curl -sf "${H[@]}" "$API/v1/operations/$KOP" | j "d['target_id']")
-B=$(curl -s "${H[@]}" -H "Idempotency-Key: $RUN-b" -X POST "$API/v1/services/$KSVC/backups" | j "d.get('id','')")
-[ -z "$B" ] || [ "$(op "$B")" = failed ] || fail "backup of a k8s service claimed success"
+[ "$(curl -s -o /tmp/e2e-k8s.out -w '%{http_code}' "${H[@]}" -H "Idempotency-Key: $RUN-b" -X POST "$API/v1/services/$KSVC/backups")" = 422 ] \
+  || fail "backup of a k8s service not refused: $(cat /tmp/e2e-k8s.out)"
 for s in "$SVC" "$KSVC"; do
   D=$(curl -sf "${H[@]}" -H "Idempotency-Key: $RUN-d-$s" -X DELETE "$API/v1/services/$s" | j "d['id']"); [ "$(op "$D")" = succeeded ] || fail "delete $s failed"
 done

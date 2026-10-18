@@ -119,7 +119,7 @@ export default function App() {
       <Text style={{ fontWeight: "600" }}>{item.display_name} · {item.project}</Text><Text>{item.template} — {item.state}{item.overlay_ip ? ` · private IP ${item.overlay_ip}` : ""}</Text>
       <View style={{ flexDirection: "row" }}>{["start", "stop", "restart"].map(a => <Button key={a} title={a} onPress={() => act(item, a)} />)}
         {item.provider_id === "kubernetes" && <Button title="scale" onPress={() => setScaleFor({ id: item.id, n: "2" })} />}
-        <Button title="back up" onPress={() => call(`/v1/services/${item.id}/backups`, { method: "POST", idempotent: true }).then(() => Alert.alert("SpadeAi", "Backup started")).catch(fail)} /></View>
+        {item.provider_id !== "kubernetes" && <Button title="back up" onPress={() => call(`/v1/services/${item.id}/backups`, { method: "POST", idempotent: true }).then(() => Alert.alert("SpadeAi", "Backup started")).catch(fail)} />}</View>
       {scaleFor?.id === item.id && <View style={{ flexDirection: "row", alignItems: "center" }}><Text>Replicas (1-20) </Text>
         <TextInput style={[st.i, { width: 60 }]} keyboardType="number-pad" value={scaleFor.n} onChangeText={n => setScaleFor({ id: item.id, n })} />
         <Button title="apply" onPress={() => scale(item, scaleFor.n)} /><Button title="cancel" onPress={() => setScaleFor(null)} /></View>}

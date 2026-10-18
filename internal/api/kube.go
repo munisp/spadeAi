@@ -188,7 +188,7 @@ func (s *Server) clusterOptions(w http.ResponseWriter, r *http.Request) {
 // KubeSpec is the "kubernetes" block of a deploy request.
 type KubeSpec struct {
 	ClusterID string `json:"cluster_id"`
-	Replicas  int    `json:"replicas"`
+	Replicas  *int   `json:"replicas,omitempty"`
 	kube.Config
 }
 
@@ -197,8 +197,9 @@ func prepareKube(ctx context.Context, tx pgx.Tx, project, tvID, size string, k *
 	if k == nil || k.ClusterID == "" {
 		return false, nil, fmt.Errorf("kubernetes deploys need kubernetes.cluster_id and kubernetes.namespace")
 	}
-	if k.Replicas == 0 {
-		k.Replicas = 1
+	if k.Replicas == nil {
+		one := 1
+		k.Replicas = &one
 	}
 	if err := tx.QueryRow(ctx, `SELECT in_nigeria FROM k8s_cluster WHERE id::text=$1 AND project_id=$2 AND deleted_at IS NULL`, k.ClusterID, project).Scan(&inNigeria); err != nil {
 		return false, nil, fmt.Errorf("cluster %s is not registered in this project", k.ClusterID)
@@ -214,14 +215,14 @@ func prepareKube(ctx context.Context, tx pgx.Tx, project, tvID, size string, k *
 		Scan(&vcpu, &ram, &disk, &compose, &manifest); err != nil {
 		return false, nil, err
 	}
-	if err := kube.Validate(&k.Config, inv, k.Replicas, disk); err != nil {
+	if err := kube.Validate(&k.Config, inv, *k.Replicas, disk); err != nil {
 		return false, nil, err
 	}
 	var m struct {
 		Health kube.Health `json:"health"`
 	}
 	_ = json.Unmarshal(manifest, &m)
-	if _, err := kube.Render(compose, m.Health, k.Config, env, k.Replicas, vcpu, ram, "check"); err != nil {
+	if _, err := kube.Render(compose, m.Health, k.Config, env, *k.Replicas, vcpu, ram, "check"); err != nil {
 		return false, nil, fmt.Errorf("template cannot run on Kubernetes: %w", err)
 	}
 	cfg, err = json.Marshal(k.Config)
